@@ -14,12 +14,12 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./novatech_local.db")
 
-# Algunos proveedores entregan "postgres://", SQLAlchemy necesita "postgresql://"
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-# Fuerza el driver psycopg2, sin importar cómo venga la URL
-DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg://", "postgresql://", 1)
+# Normaliza la URL y fuerza el driver psycopg2 (el de requirements.txt),
+# sin importar cómo venga escrita ni qué versión de SQLAlchemy se instale.
+for prefijo in ("postgres://", "postgresql+psycopg://", "postgresql://"):
+    if DATABASE_URL.startswith(prefijo):
+        DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len(prefijo):]
+        break
 
 _es_sqlite = DATABASE_URL.startswith("sqlite")
 
