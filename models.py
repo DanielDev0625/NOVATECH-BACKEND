@@ -1,8 +1,8 @@
 import enum
 import os
-from dotenv import load_dotenv
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from sqlalchemy import Boolean, Column, DateTime, Enum, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -17,6 +17,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./novatech_local.db")
 # Algunos proveedores entregan "postgres://", SQLAlchemy necesita "postgresql://"
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Fuerza el driver psycopg2, sin importar cómo venga la URL
+DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg://", "postgresql://", 1)
 
 _es_sqlite = DATABASE_URL.startswith("sqlite")
 
