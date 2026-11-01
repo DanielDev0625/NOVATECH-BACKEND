@@ -291,3 +291,45 @@ class CompraSugerida(ModeloBase):
     aprobada_por = relationship("Usuario", foreign_keys=[aprobada_por_id])
     recibida_por = relationship("Usuario", foreign_keys=[recibida_por_id])
     resuelta_por = relationship("Usuario", foreign_keys=[resuelta_por_id])
+
+
+# ---------------------------------------------------------------------------
+# B5: VEHÍCULOS, POSICIÓN DEL TRANSPORTISTA Y LIQUIDACIÓN
+# ---------------------------------------------------------------------------
+class Vehiculo(ModeloBase):
+    __tablename__ = "vehiculos"
+
+    placa = Column(String(10), unique=True, index=True, nullable=False)
+    tipo = Column(String(20), nullable=False)               # moto, carro, camioneta o camion
+    descripcion = Column(String(100))
+    transportista_id = Column(Integer, ForeignKey("usuarios.id"), unique=True)   # un vehículo por transportista
+    activo = Column(Boolean, default=True, nullable=False)
+
+    transportista = relationship("Usuario")
+
+
+class PosicionTransportista(ModeloBase):
+    """Última posición conocida de cada transportista (se actualiza; no guarda historial)."""
+    __tablename__ = "posiciones_transportista"
+
+    transportista_id = Column(Integer, ForeignKey("usuarios.id"), unique=True, index=True, nullable=False)
+    latitud = Column(Float, nullable=False)
+    longitud = Column(Float, nullable=False)
+    actualizada_en = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                            onupdate=lambda: datetime.now(timezone.utc))
+
+
+class Liquidacion(ModeloBase):
+    """Una por entrega: guarda la tarifa y la comisión vigentes en el momento de entregar."""
+    __tablename__ = "liquidaciones"
+
+    pedido_id = Column(Integer, ForeignKey("pedidos.id"), unique=True, index=True, nullable=False)
+    transportista_id = Column(Integer, ForeignKey("usuarios.id"), index=True, nullable=False)
+    tarifa = Column(Numeric(14, 2), nullable=False)
+    comision_porcentaje = Column(Numeric(5, 2), nullable=False)
+    comision = Column(Numeric(14, 2), nullable=False)        # lo que gana el transportista
+    pagada = Column(Boolean, default=False, nullable=False)
+    fecha_pago = Column(DateTime(timezone=True))
+
+    pedido = relationship("Pedido")
+    transportista = relationship("Usuario")

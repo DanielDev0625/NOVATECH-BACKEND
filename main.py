@@ -39,16 +39,19 @@ from models import (
     CompraSugerida,
     Configuracion,
     Direccion,
+    Liquidacion,
     Lote,
     LoteEstado,
     Pedido,
     PedidoDetalle,
     PedidoEstado,
     PedidoEvento,
+    PosicionTransportista,
     Producto,
     Rol,
     SessionLocal,
     Usuario,
+    Vehiculo,
     engine,
 )
 
@@ -605,7 +608,10 @@ def ver_configuracion(
     _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
 ):
     return {"margen": float(obtener_margen(db)), "plazo_entrega_dias": obtener_plazo_entrega(db),
-            "plazo_compra_dias": obtener_plazo_compra(db)}
+            "plazo_compra_dias": obtener_plazo_compra(db),
+            "tarifa_entrega": float(obtener_tarifa_entrega(db)),
+            "comision_porcentaje": float(obtener_comision(db)),
+            "bodega": dict(zip(("latitud", "longitud"), obtener_bodega(db)))}
 
 
 @app.put("/configuracion/margen", tags=["configuracion"])
@@ -1592,10 +1598,16 @@ def recibir_transportista(
     exigir_estado(pedido, PedidoEstado.en_zona_envios)
     if datos.codigo.strip().upper() != pedido.codigo:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "El QR no corresponde a este pedido")
+    vehiculo = vehiculo_del_transportista(db, transportista)
+    if vehiculo is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No tienes un vehículo asignado; pídele al administrador que te asigne uno",
+        )
     pedido.estado = PedidoEstado.recibido_transportista
     pedido.transportista_id = transportista.id
     registrar_evento(db, pedido, PedidoEstado.recibido_transportista, transportista,
-                     datos.latitud, datos.longitud)
+                     datos.latitud, datos.longitud, nota=f"Vehículo {vehiculo.placa}")
     db.commit()
     db.refresh(pedido)
     return pedido_a_out(pedido, transportista)
@@ -1635,6 +1647,7 @@ def entregar_pedido(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "El QR de entrega no es válido")
     pedido.estado = PedidoEstado.entregado
     registrar_evento(db, pedido, PedidoEstado.entregado, transportista, datos.latitud, datos.longitud)
+    crear_liquidacion(db, pedido, transportista)
     db.commit()
     db.refresh(pedido)
     return pedido_a_out(pedido, transportista)
@@ -1988,3 +2001,608 @@ def resolver_diferencias(
         raise HTTPException(status.HTTP_409_CONFLICT, "No se pudo guardar la decisión; intenta de nuevo")
     db.refresh(compra)
     return compra_a_out(compra, stock_por_producto(db))
+
+
+# ===========================================================================
+# B5: CONSTANTES Y ESQUEMAS DE LOGÍSTICA
+# ===========================================================================
+TARIFA_ENTREGA_POR_DEFECTO = Decimal("8000")     # valor fijo por entrega (provisional)
+COMISION_POR_DEFECTO = Decimal("70")             # % de la tarifa que gana el transportista (provisional)
+BODEGA_POR_DEFECTO = (10.9685, -74.7813)         # punto de salida de las rutas (Barranquilla)
+
+FACTOR_VIAL = 1.3                # la distancia por calle es mayor que la línea recta
+VELOCIDAD_PROMEDIO_KMH = 25.0    # velocidad urbana promedio para estimar la llegada
+MINUTOS_POR_PARADA = 5           # tiempo que toma cada entrega
+
+ESTADOS_EN_REPARTO = (PedidoEstado.recibido_transportista, PedidoEstado.en_ruta)
+
+
+class VehiculoCrear(BaseModel):
+    placa: str = Field(min_length=5, max_length=10, pattern=r"^[A-Za-z0-9-]+$")
+    tipo: Literal["moto", "carro", "camioneta", "camion"]
+    descripcion: Optional[str] = Field(default=None, max_length=100)
+
+    @field_validator("placa")
+    @classmethod
+    def placa_en_mayuscula(cls, v: str) -> str:
+        return v.upper()
+
+
+class AsignarVehiculoIn(BaseModel):
+    transportista_id: Optional[int] = None      # null para dejar el vehículo sin asignar
+
+
+class VehiculoOut(BaseModel):
+    id: int
+    placa: str
+    tipo: str
+    descripcion: Optional[str]
+    activo: bool
+    transportista_id: Optional[int]
+    transportista: Optional[str]
+
+
+class LiquidacionConfigIn(BaseModel):
+    tarifa_entrega: float = Field(gt=0, le=10_000_000)
+    comision_porcentaje: float = Field(ge=0, le=100)
+
+
+class BodegaIn(BaseModel):
+    latitud: float = Field(ge=-90, le=90)
+    longitud: float = Field(ge=-180, le=180)
+
+
+class PosicionNuevaIn(BaseModel):
+    latitud: float = Field(ge=-90, le=90)
+    longitud: float = Field(ge=-180, le=180)
+
+
+class ParadaOut(BaseModel):
+    orden: int
+    pedido_id: int
+    codigo: str
+    cliente: str
+    estado: PedidoEstado
+    direccion: DireccionOut
+    distancia_km: float            # desde la parada anterior (o el origen)
+    km_acumulados: float
+    eta_minutos: int               # minutos estimados desde ahora
+
+
+class RutaOut(BaseModel):
+    origen_latitud: float
+    origen_longitud: float
+    origen_es_posicion_real: bool  # false = sale desde la bodega
+    paradas: List[ParadaOut]
+    total_km: float
+    tiempo_total_minutos: int
+
+
+class PosicionOut(BaseModel):
+    latitud: float
+    longitud: float
+    segundos_desde_actualizacion: Optional[int]
+
+
+class SeguimientoOut(BaseModel):
+    pedido_id: int
+    codigo: str
+    estado: PedidoEstado
+    destino_latitud: float
+    destino_longitud: float
+    transportista_posicion: Optional[PosicionOut]
+    parada: Optional[int]
+    eta_minutos: Optional[int]
+
+
+class TransportistaEstadoOut(BaseModel):
+    transportista_id: int
+    nombre: str
+    placa: Optional[str]
+    entregas_activas: int
+    posicion: Optional[PosicionOut]
+
+
+class LiquidacionOut(BaseModel):
+    id: int
+    pedido_id: int
+    pedido: str
+    transportista_id: int
+    transportista: str
+    fecha: Optional[datetime]
+    tarifa: float
+    comision_porcentaje: float
+    comision: float
+    pagada: bool
+    fecha_pago: Optional[datetime]
+
+
+class LiquidacionesOut(BaseModel):
+    items: List[LiquidacionOut]
+    total_comision: float
+    total_pendiente: float
+    total_pagado: float
+
+
+class ResumenTransportistaOut(BaseModel):
+    transportista_id: int
+    transportista: str
+    entregas: int
+    comision_pendiente: float
+    comision_pagada: float
+
+
+class PagarIn(BaseModel):
+    transportista_id: int
+
+
+# ===========================================================================
+# CONFIGURACIÓN: tarifa, comisión y bodega
+# ===========================================================================
+def obtener_config(db: Session, clave: str, defecto: str) -> str:
+    fila = db.query(Configuracion).filter(Configuracion.clave == clave).first()
+    return fila.valor if fila else defecto
+
+
+def guardar_config(db: Session, clave: str, valor: str) -> None:
+    fila = db.query(Configuracion).filter(Configuracion.clave == clave).first()
+    if fila is None:
+        db.add(Configuracion(clave=clave, valor=valor))
+    else:
+        fila.valor = valor
+
+
+def _decimal_config(db: Session, clave: str, defecto: Decimal) -> Decimal:
+    try:
+        return Decimal(obtener_config(db, clave, str(defecto)))
+    except InvalidOperation:
+        return defecto
+
+
+def obtener_tarifa_entrega(db: Session) -> Decimal:
+    return _decimal_config(db, "tarifa_entrega", TARIFA_ENTREGA_POR_DEFECTO)
+
+
+def obtener_comision(db: Session) -> Decimal:
+    return _decimal_config(db, "comision_porcentaje", COMISION_POR_DEFECTO)
+
+
+def obtener_bodega(db: Session) -> tuple:
+    try:
+        return (
+            float(obtener_config(db, "bodega_latitud", str(BODEGA_POR_DEFECTO[0]))),
+            float(obtener_config(db, "bodega_longitud", str(BODEGA_POR_DEFECTO[1]))),
+        )
+    except ValueError:
+        return BODEGA_POR_DEFECTO
+
+
+@app.put("/configuracion/liquidacion", tags=["configuracion"])
+def cambiar_liquidacion(
+    datos: LiquidacionConfigIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Tarifa fija por entrega (debe ser mayor que cero) y % de comisión del transportista.
+    Aplica a las entregas nuevas; las ya liquidadas conservan lo que tenían."""
+    guardar_config(db, "tarifa_entrega", str(Decimal(str(datos.tarifa_entrega))))
+    guardar_config(db, "comision_porcentaje", str(Decimal(str(datos.comision_porcentaje))))
+    db.commit()
+    return {"tarifa_entrega": datos.tarifa_entrega, "comision_porcentaje": datos.comision_porcentaje}
+
+
+@app.put("/configuracion/bodega", tags=["configuracion"])
+def cambiar_bodega(
+    datos: BodegaIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Punto desde el que salen las rutas cuando el transportista aún no ha enviado su posición."""
+    guardar_config(db, "bodega_latitud", str(datos.latitud))
+    guardar_config(db, "bodega_longitud", str(datos.longitud))
+    db.commit()
+    return {"latitud": datos.latitud, "longitud": datos.longitud}
+
+
+# ===========================================================================
+# MÓDULO: VEHÍCULOS (administrador)
+# ===========================================================================
+def vehiculo_a_out(v: Vehiculo) -> VehiculoOut:
+    return VehiculoOut(
+        id=v.id, placa=v.placa, tipo=v.tipo, descripcion=v.descripcion, activo=v.activo,
+        transportista_id=v.transportista_id,
+        transportista=v.transportista.nombre if v.transportista else None,
+    )
+
+
+def vehiculo_del_transportista(db: Session, transportista: Usuario) -> Optional[Vehiculo]:
+    return (
+        db.query(Vehiculo)
+        .filter(Vehiculo.transportista_id == transportista.id, Vehiculo.activo.is_(True))
+        .first()
+    )
+
+
+@app.post("/vehiculos", response_model=VehiculoOut, status_code=201, tags=["vehiculos"])
+def crear_vehiculo(
+    datos: VehiculoCrear,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    if db.query(Vehiculo).filter(Vehiculo.placa == datos.placa).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe un vehículo con esa placa")
+    vehiculo = Vehiculo(
+        placa=datos.placa, tipo=datos.tipo, descripcion=(datos.descripcion or "").strip() or None,
+    )
+    db.add(vehiculo)
+    db.commit()
+    db.refresh(vehiculo)
+    return vehiculo_a_out(vehiculo)
+
+
+@app.get("/vehiculos", response_model=List[VehiculoOut], tags=["vehiculos"])
+def listar_vehiculos(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    return [vehiculo_a_out(v) for v in db.query(Vehiculo).order_by(Vehiculo.id).all()]
+
+
+@app.patch("/vehiculos/{vehiculo_id}/asignar", response_model=VehiculoOut, tags=["vehiculos"])
+def asignar_vehiculo(
+    vehiculo_id: int,
+    datos: AsignarVehiculoIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Asigna el vehículo a un transportista (o lo deja libre con transportista_id = null)."""
+    vehiculo = db.get(Vehiculo, vehiculo_id)
+    if vehiculo is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vehículo no encontrado")
+    if datos.transportista_id is not None:
+        transportista = db.get(Usuario, datos.transportista_id)
+        if transportista is None or transportista.rol != Rol.transportista or not transportista.activo:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Transportista no encontrado")
+        otro = (
+            db.query(Vehiculo)
+            .filter(Vehiculo.transportista_id == transportista.id, Vehiculo.id != vehiculo.id)
+            .first()
+        )
+        if otro is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Ese transportista ya tiene asignado el vehículo {otro.placa}; libéralo primero",
+            )
+    vehiculo.transportista_id = datos.transportista_id
+    db.commit()
+    db.refresh(vehiculo)
+    return vehiculo_a_out(vehiculo)
+
+
+# ===========================================================================
+# RUTAS: orden de paradas, distancias y tiempos estimados
+# ===========================================================================
+def distancia_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distancia en línea recta entre dos puntos (fórmula de Haversine)."""
+    radio = 6371.0
+    f1, f2 = math.radians(lat1), math.radians(lat2)
+    df = f2 - f1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(df / 2) ** 2 + math.cos(f1) * math.cos(f2) * math.sin(dl / 2) ** 2
+    return 2 * radio * math.asin(math.sqrt(a))
+
+
+def planear_ruta(origen: tuple, paradas: list) -> list:
+    """Ordena las paradas yendo siempre a la más cercana y calcula distancias y llegada estimada.
+    origen: (latitud, longitud). paradas: lista de dicts con 'latitud' y 'longitud'.
+    Este es el único punto que habría que cambiar para usar un servicio de mapas con tráfico real."""
+    pendientes = list(paradas)
+    actual = origen
+    km_acumulados = 0.0
+    plan = []
+    while pendientes:
+        siguiente = min(
+            pendientes,
+            key=lambda p: distancia_km(actual[0], actual[1], p["latitud"], p["longitud"]),
+        )
+        pendientes.remove(siguiente)
+        tramo = distancia_km(actual[0], actual[1], siguiente["latitud"], siguiente["longitud"]) * FACTOR_VIAL
+        km_acumulados += tramo
+        orden = len(plan) + 1
+        eta = round(km_acumulados / VELOCIDAD_PROMEDIO_KMH * 60 + MINUTOS_POR_PARADA * (orden - 1))
+        plan.append({
+            **siguiente,
+            "orden": orden,
+            "distancia_km": round(tramo, 2),
+            "km_acumulados": round(km_acumulados, 2),
+            "eta_minutos": eta,
+        })
+        actual = (siguiente["latitud"], siguiente["longitud"])
+    return plan
+
+
+def posicion_a_out(pos: PosicionTransportista) -> PosicionOut:
+    segundos = None
+    if pos.actualizada_en is not None:
+        momento = pos.actualizada_en
+        if momento.tzinfo is None:
+            momento = momento.replace(tzinfo=timezone.utc)
+        segundos = max(int((datetime.now(timezone.utc) - momento).total_seconds()), 0)
+    return PosicionOut(latitud=pos.latitud, longitud=pos.longitud, segundos_desde_actualizacion=segundos)
+
+
+def guardar_posicion(db: Session, transportista: Usuario, latitud: float, longitud: float) -> None:
+    pos = db.query(PosicionTransportista).filter(
+        PosicionTransportista.transportista_id == transportista.id
+    ).first()
+    if pos is None:
+        db.add(PosicionTransportista(transportista_id=transportista.id, latitud=latitud, longitud=longitud))
+    else:
+        pos.latitud = latitud
+        pos.longitud = longitud
+        pos.actualizada_en = datetime.now(timezone.utc)
+
+
+def ruta_del_transportista(db: Session, transportista_id: int) -> tuple:
+    """Devuelve (origen, es_posicion_real, plan) con las paradas pendientes de ese transportista."""
+    pos = db.query(PosicionTransportista).filter(
+        PosicionTransportista.transportista_id == transportista_id
+    ).first()
+    if pos is not None:
+        origen, es_real = (pos.latitud, pos.longitud), True
+    else:
+        origen, es_real = obtener_bodega(db), False
+    pedidos = (
+        db.query(Pedido)
+        .filter(Pedido.transportista_id == transportista_id, Pedido.estado.in_(ESTADOS_EN_REPARTO))
+        .all()
+    )
+    paradas = [
+        {
+            "pedido": p, "latitud": p.direccion.latitud, "longitud": p.direccion.longitud,
+        }
+        for p in pedidos
+    ]
+    return origen, es_real, planear_ruta(origen, paradas)
+
+
+@app.post("/logistica/posicion", tags=["logistica"])
+def enviar_posicion(
+    datos: PosicionNuevaIn,
+    db: Session = Depends(get_db),
+    transportista: Usuario = Depends(requiere_roles(Rol.transportista)),
+):
+    """La app del transportista envía su posición mientras dura la entrega."""
+    guardar_posicion(db, transportista, datos.latitud, datos.longitud)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/logistica/ruta", response_model=RutaOut, tags=["logistica"])
+def mi_ruta(
+    db: Session = Depends(get_db),
+    transportista: Usuario = Depends(requiere_roles(Rol.transportista)),
+):
+    """Paradas del transportista en el orden más eficiente, con distancia y hora estimada de cada una."""
+    origen, es_real, plan = ruta_del_transportista(db, transportista.id)
+    paradas = []
+    for p in plan:
+        pedido = p["pedido"]
+        paradas.append(ParadaOut(
+            orden=p["orden"], pedido_id=pedido.id, codigo=pedido.codigo, cliente=pedido.cliente.nombre,
+            estado=pedido.estado, direccion=direccion_a_out(pedido.direccion),
+            distancia_km=p["distancia_km"], km_acumulados=p["km_acumulados"], eta_minutos=p["eta_minutos"],
+        ))
+    return RutaOut(
+        origen_latitud=origen[0], origen_longitud=origen[1], origen_es_posicion_real=es_real,
+        paradas=paradas,
+        total_km=plan[-1]["km_acumulados"] if plan else 0.0,
+        tiempo_total_minutos=plan[-1]["eta_minutos"] if plan else 0,
+    )
+
+
+@app.post("/logistica/iniciar-ruta", response_model=List[PedidoResumenOut], tags=["logistica"])
+def iniciar_ruta_completa(
+    datos: Optional[PosicionIn] = None,
+    db: Session = Depends(get_db),
+    transportista: Usuario = Depends(requiere_roles(Rol.transportista)),
+):
+    """Toca «Iniciar ruta»: todos los paquetes que recibió pasan a «en ruta» de una vez."""
+    pedidos = (
+        db.query(Pedido)
+        .filter(
+            Pedido.transportista_id == transportista.id,
+            Pedido.estado == PedidoEstado.recibido_transportista,
+        )
+        .with_for_update()
+        .all()
+    )
+    if not pedidos:
+        raise HTTPException(status.HTTP_409_CONFLICT, "No tienes paquetes recibidos para iniciar la ruta")
+    latitud = datos.latitud if datos else None
+    longitud = datos.longitud if datos else None
+    for pedido in pedidos:
+        pedido.estado = PedidoEstado.en_ruta
+        registrar_evento(db, pedido, PedidoEstado.en_ruta, transportista, latitud, longitud)
+    if latitud is not None and longitud is not None:
+        guardar_posicion(db, transportista, latitud, longitud)
+    db.commit()
+    for pedido in pedidos:
+        db.refresh(pedido)
+    return [pedido_a_resumen(p, transportista) for p in pedidos]
+
+
+@app.get("/pedidos/{pedido_id}/seguimiento", response_model=SeguimientoOut, tags=["logistica"])
+def seguimiento_pedido(
+    pedido_id: int,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(usuario_actual),
+):
+    """Para el mapa del cliente: posición del transportista y hora estimada, solo mientras va en ruta."""
+    pedido = cargar_pedido(db, pedido_id)
+    if usuario.rol == Rol.usuario and pedido.cliente_id != usuario.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Pedido no encontrado")
+    posicion = None
+    parada = None
+    eta = None
+    if pedido.estado == PedidoEstado.en_ruta and pedido.transportista_id is not None:
+        pos = db.query(PosicionTransportista).filter(
+            PosicionTransportista.transportista_id == pedido.transportista_id
+        ).first()
+        if pos is not None:
+            posicion = posicion_a_out(pos)
+        _, _, plan = ruta_del_transportista(db, pedido.transportista_id)
+        for p in plan:
+            if p["pedido"].id == pedido.id:
+                parada, eta = p["orden"], p["eta_minutos"]
+    return SeguimientoOut(
+        pedido_id=pedido.id, codigo=pedido.codigo, estado=pedido.estado,
+        destino_latitud=pedido.direccion.latitud, destino_longitud=pedido.direccion.longitud,
+        transportista_posicion=posicion, parada=parada, eta_minutos=eta,
+    )
+
+
+@app.get("/logistica/transportistas", response_model=List[TransportistaEstadoOut], tags=["logistica"])
+def estado_transportistas(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Vista de gerencia: cada transportista con su vehículo, entregas activas y última posición."""
+    transportistas = (
+        db.query(Usuario)
+        .filter(Usuario.rol == Rol.transportista, Usuario.activo.is_(True))
+        .order_by(Usuario.nombre)
+        .all()
+    )
+    placas = {v.transportista_id: v.placa for v in db.query(Vehiculo).filter(Vehiculo.activo.is_(True)).all()}
+    posiciones = {p.transportista_id: p for p in db.query(PosicionTransportista).all()}
+    activas = dict(
+        db.query(Pedido.transportista_id, func.count(Pedido.id))
+        .filter(Pedido.estado.in_(ESTADOS_EN_REPARTO), Pedido.transportista_id.isnot(None))
+        .group_by(Pedido.transportista_id)
+        .all()
+    )
+    return [
+        TransportistaEstadoOut(
+            transportista_id=t.id, nombre=t.nombre, placa=placas.get(t.id),
+            entregas_activas=int(activas.get(t.id, 0)),
+            posicion=posicion_a_out(posiciones[t.id]) if t.id in posiciones else None,
+        )
+        for t in transportistas
+    ]
+
+
+# ===========================================================================
+# MÓDULO: LIQUIDACIÓN (tarifa por entrega y comisión del transportista)
+# ===========================================================================
+def crear_liquidacion(db: Session, pedido: Pedido, transportista: Usuario) -> Liquidacion:
+    """Se llama al entregar: congela la tarifa y la comisión vigentes en ese momento."""
+    tarifa = obtener_tarifa_entrega(db)
+    if tarifa <= 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "La tarifa de entrega debe ser mayor que cero")
+    porcentaje = obtener_comision(db)
+    liquidacion = Liquidacion(
+        pedido_id=pedido.id,
+        transportista_id=transportista.id,
+        tarifa=tarifa,
+        comision_porcentaje=porcentaje,
+        comision=(tarifa * porcentaje / 100).quantize(Decimal("0.01")),
+    )
+    db.add(liquidacion)
+    return liquidacion
+
+
+def liquidacion_a_out(liq: Liquidacion) -> LiquidacionOut:
+    return LiquidacionOut(
+        id=liq.id, pedido_id=liq.pedido_id, pedido=liq.pedido.codigo,
+        transportista_id=liq.transportista_id, transportista=liq.transportista.nombre,
+        fecha=liq.creado_en, tarifa=float(liq.tarifa),
+        comision_porcentaje=float(liq.comision_porcentaje), comision=float(liq.comision),
+        pagada=liq.pagada, fecha_pago=liq.fecha_pago,
+    )
+
+
+def armar_liquidaciones(filas: List[Liquidacion]) -> LiquidacionesOut:
+    items = [liquidacion_a_out(f) for f in filas]
+    total = sum(i.comision for i in items)
+    pendiente = sum(i.comision for i in items if not i.pagada)
+    return LiquidacionesOut(
+        items=items, total_comision=round(total, 2),
+        total_pendiente=round(pendiente, 2), total_pagado=round(total - pendiente, 2),
+    )
+
+
+@app.get("/liquidaciones/mias", response_model=LiquidacionesOut, tags=["liquidacion"])
+def mis_liquidaciones(
+    pagada: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    transportista: Usuario = Depends(requiere_roles(Rol.transportista)),
+):
+    """«Mi liquidación»: entregas hechas, tarifa y comisión, con el total pendiente."""
+    consulta = db.query(Liquidacion).filter(Liquidacion.transportista_id == transportista.id)
+    if pagada is not None:
+        consulta = consulta.filter(Liquidacion.pagada.is_(pagada))
+    return armar_liquidaciones(consulta.order_by(Liquidacion.id.desc()).all())
+
+
+@app.get("/liquidaciones/resumen", response_model=List[ResumenTransportistaOut], tags=["liquidacion"])
+def resumen_liquidaciones(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Por transportista: cuántas entregas hizo y cuánta comisión tiene pendiente y pagada."""
+    resumen = {}
+    for liq in db.query(Liquidacion).all():
+        fila = resumen.setdefault(liq.transportista_id, {
+            "nombre": liq.transportista.nombre, "entregas": 0, "pendiente": Decimal("0"), "pagada": Decimal("0"),
+        })
+        fila["entregas"] += 1
+        fila["pagada" if liq.pagada else "pendiente"] += liq.comision
+    return [
+        ResumenTransportistaOut(
+            transportista_id=tid, transportista=f["nombre"], entregas=f["entregas"],
+            comision_pendiente=float(f["pendiente"]), comision_pagada=float(f["pagada"]),
+        )
+        for tid, f in sorted(resumen.items(), key=lambda x: x[1]["nombre"])
+    ]
+
+
+@app.get("/liquidaciones", response_model=LiquidacionesOut, tags=["liquidacion"])
+def listar_liquidaciones(
+    transportista_id: Optional[int] = None,
+    pagada: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    consulta = db.query(Liquidacion)
+    if transportista_id is not None:
+        consulta = consulta.filter(Liquidacion.transportista_id == transportista_id)
+    if pagada is not None:
+        consulta = consulta.filter(Liquidacion.pagada.is_(pagada))
+    return armar_liquidaciones(consulta.order_by(Liquidacion.id.desc()).all())
+
+
+@app.post("/liquidaciones/pagar", tags=["liquidacion"])
+def pagar_liquidaciones(
+    datos: PagarIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Marca como pagadas todas las comisiones pendientes de un transportista."""
+    pendientes = (
+        db.query(Liquidacion)
+        .filter(Liquidacion.transportista_id == datos.transportista_id, Liquidacion.pagada.is_(False))
+        .with_for_update()
+        .all()
+    )
+    if not pendientes:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Ese transportista no tiene comisiones pendientes")
+    ahora = datetime.now(timezone.utc)
+    total = Decimal("0")
+    for liq in pendientes:
+        liq.pagada = True
+        liq.fecha_pago = ahora
+        total += liq.comision
+    db.commit()
+    return {"transportista_id": datos.transportista_id, "liquidaciones_pagadas": len(pendientes),
+            "total_pagado": float(total)}
