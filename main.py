@@ -5,6 +5,7 @@ App, seguridad (hash, JWT, roles) y rutas.
   B2: catálogo, importación de Excel y lotes con código autogenerado.
 """
 import io
+import math
 import os
 import re
 import secrets
@@ -34,6 +35,8 @@ from models import (
     AsignacionLote,
     Base,
     Categoria,
+    CompraEstado,
+    CompraSugerida,
     Configuracion,
     Direccion,
     Lote,
@@ -69,6 +72,10 @@ MARGEN_POR_DEFECTO = Decimal("20")
 STOCK_MINIMO_POR_DEFECTO = 5
 # Plazo de entrega prometido al cliente (en días). El administrador lo cambia desde la API.
 PLAZO_ENTREGA_DIAS_POR_DEFECTO = 2
+# Compras sugeridas: plazo de entrega del proveedor (días), ventana de ventas que se mira y días extra de cobertura.
+PLAZO_COMPRA_DIAS_POR_DEFECTO = 2
+VENTANA_VENTAS_DIAS = 30
+DIAS_COBERTURA = 7
 
 MAX_BYTES_EXCEL = 5 * 1024 * 1024
 MAX_FILAS_EXCEL = 2000
@@ -597,7 +604,8 @@ def ver_configuracion(
     db: Session = Depends(get_db),
     _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
 ):
-    return {"margen": float(obtener_margen(db)), "plazo_entrega_dias": obtener_plazo_entrega(db)}
+    return {"margen": float(obtener_margen(db)), "plazo_entrega_dias": obtener_plazo_entrega(db),
+            "plazo_compra_dias": obtener_plazo_compra(db)}
 
 
 @app.put("/configuracion/margen", tags=["configuracion"])
@@ -1431,6 +1439,13 @@ def crear_pedido(
     except IntegrityError:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "No se pudo registrar el pedido; intenta de nuevo")
+    # Sugerencia automática: si el stock bajó del mínimo, queda una compra sugerida para el gerente.
+    try:
+        sugerir_compras(db, list(cantidades))
+        db.commit()
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
     db.refresh(pedido)
     return pedido_a_out(pedido, cliente)
 
@@ -1623,3 +1638,353 @@ def entregar_pedido(
     db.commit()
     db.refresh(pedido)
     return pedido_a_out(pedido, transportista)
+
+
+# ===========================================================================
+# B4: ESQUEMAS DE COMPRAS
+# ===========================================================================
+ESTADOS_COMPRA_ABIERTOS = (
+    CompraEstado.sugerida,
+    CompraEstado.aprobada,
+    CompraEstado.con_diferencias,
+)
+
+
+class AprobarCompraIn(BaseModel):
+    proveedor: Optional[str] = Field(default=None, max_length=100)    # dato opcional; no se contacta
+
+
+class RechazarCompraIn(BaseModel):
+    nota: Optional[str] = Field(default=None, max_length=255)
+
+
+class RecibirCompraIn(BaseModel):
+    cantidad_buena: int = Field(ge=0, le=100000)
+    cantidad_danada: int = Field(default=0, ge=0, le=100000)
+
+
+class ResolverCompraIn(BaseModel):
+    decision: Literal["aceptar", "descartar"]
+    nota: Optional[str] = Field(default=None, max_length=255)
+
+
+class CompraOut(BaseModel):
+    id: int
+    codigo: str
+    estado: CompraEstado
+    producto_id: int
+    sku: str
+    producto: str
+    stock_actual: int
+    stock_minimo: int
+    cantidad_sugerida: int
+    proveedor: Optional[str]
+    creado_en: Optional[datetime]
+    aprobada_por: Optional[str]
+    fecha_aprobacion: Optional[datetime]
+    fecha_estimada: Optional[datetime]
+    atrasada: bool
+    dias_atraso: int
+    recibida_por: Optional[str]
+    fecha_recepcion: Optional[datetime]
+    cantidad_buena: Optional[int]
+    cantidad_danada: Optional[int]
+    diferencia: Optional[int]          # recibido (bueno + dañado) menos lo aprobado
+    lote: Optional[str]
+    nota: Optional[str]
+
+
+# ===========================================================================
+# COMPRAS: sugerencia automática
+# ===========================================================================
+def obtener_plazo_compra(db: Session) -> int:
+    fila = db.query(Configuracion).filter(Configuracion.clave == "plazo_compra_dias").first()
+    try:
+        return int(fila.valor) if fila else PLAZO_COMPRA_DIAS_POR_DEFECTO
+    except ValueError:
+        return PLAZO_COMPRA_DIAS_POR_DEFECTO
+
+
+@app.put("/configuracion/plazo-compra", tags=["configuracion"])
+def cambiar_plazo_compra(
+    datos: PlazoIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Días que tarda en llegar una compra aprobada (se usa para la fecha estimada y la cantidad sugerida)."""
+    fila = db.query(Configuracion).filter(Configuracion.clave == "plazo_compra_dias").first()
+    if fila is None:
+        db.add(Configuracion(clave="plazo_compra_dias", valor=str(datos.dias)))
+    else:
+        fila.valor = str(datos.dias)
+    db.commit()
+    return {"plazo_compra_dias": datos.dias}
+
+
+def calcular_cantidad_sugerida(ventas_periodo: int, stock_actual: int, stock_minimo: int, plazo: int) -> int:
+    """Cantidad a comprar: lo que se vende en el plazo de entrega más unos días de cobertura,
+    sobre el stock mínimo, menos lo que ya hay. Nunca baja de 1 ni de lo necesario para llegar a 2 veces el mínimo."""
+    promedio_diario = ventas_periodo / VENTANA_VENTAS_DIAS
+    nivel_objetivo = max(
+        stock_minimo * 2,
+        math.ceil(promedio_diario * (plazo + DIAS_COBERTURA)) + stock_minimo,
+    )
+    return max(nivel_objetivo - stock_actual, 1)
+
+
+def sugerir_compras(db: Session, producto_ids: Optional[list] = None) -> List[CompraSugerida]:
+    """Crea una compra sugerida por cada producto activo cuyo stock llegó al mínimo o menos
+    y que aún no tenga una compra abierta. No hace commit: lo hace quien la llama."""
+    consulta = db.query(Producto).filter(Producto.activo.is_(True))
+    if producto_ids is not None:
+        consulta = consulta.filter(Producto.id.in_(producto_ids))
+    productos = consulta.all()
+    if not productos:
+        return []
+
+    stock = stock_por_producto(db)
+    abiertas = {
+        pid for (pid,) in db.query(CompraSugerida.producto_id)
+        .filter(CompraSugerida.estado.in_(ESTADOS_COMPRA_ABIERTOS)).all()
+    }
+    desde = datetime.now(timezone.utc) - timedelta(days=VENTANA_VENTAS_DIAS)
+    ventas = {
+        pid: int(total) for pid, total in (
+            db.query(PedidoDetalle.producto_id, func.sum(PedidoDetalle.cantidad))
+            .join(Pedido, Pedido.id == PedidoDetalle.pedido_id)
+            .filter(Pedido.creado_en >= desde, Pedido.estado != PedidoEstado.cancelado)
+            .group_by(PedidoDetalle.producto_id)
+            .all()
+        )
+    }
+    plazo = obtener_plazo_compra(db)
+
+    nuevas = []
+    for producto in productos:
+        actual = stock.get(producto.id, 0)
+        if actual > producto.stock_minimo or producto.id in abiertas:
+            continue
+        compra = CompraSugerida(
+            codigo=siguiente_codigo(db, CompraSugerida.codigo, "COM"),
+            producto_id=producto.id,
+            cantidad_sugerida=calcular_cantidad_sugerida(
+                ventas.get(producto.id, 0), actual, producto.stock_minimo, plazo,
+            ),
+            estado=CompraEstado.sugerida,
+        )
+        db.add(compra)
+        db.flush()    # asigna el código ya, para que la siguiente tome el número que sigue
+        nuevas.append(compra)
+    return nuevas
+
+
+def compra_a_out(compra: CompraSugerida, stock: dict) -> CompraOut:
+    ahora = datetime.now(timezone.utc)
+    atrasada = False
+    dias_atraso = 0
+    if compra.estado == CompraEstado.aprobada and compra.fecha_estimada is not None:
+        estimada = compra.fecha_estimada
+        if estimada.tzinfo is None:
+            estimada = estimada.replace(tzinfo=timezone.utc)
+        if estimada < ahora:
+            atrasada = True
+            dias_atraso = max((ahora - estimada).days, 0)
+    recibido = None
+    if compra.cantidad_buena is not None:
+        recibido = compra.cantidad_buena + (compra.cantidad_danada or 0) - compra.cantidad_sugerida
+    return CompraOut(
+        id=compra.id, codigo=compra.codigo, estado=compra.estado,
+        producto_id=compra.producto_id, sku=compra.producto.sku, producto=compra.producto.nombre,
+        stock_actual=stock.get(compra.producto_id, 0), stock_minimo=compra.producto.stock_minimo,
+        cantidad_sugerida=compra.cantidad_sugerida, proveedor=compra.proveedor,
+        creado_en=compra.creado_en,
+        aprobada_por=compra.aprobada_por.nombre if compra.aprobada_por else None,
+        fecha_aprobacion=compra.fecha_aprobacion, fecha_estimada=compra.fecha_estimada,
+        atrasada=atrasada, dias_atraso=dias_atraso,
+        recibida_por=compra.recibida_por.nombre if compra.recibida_por else None,
+        fecha_recepcion=compra.fecha_recepcion,
+        cantidad_buena=compra.cantidad_buena, cantidad_danada=compra.cantidad_danada,
+        diferencia=recibido, lote=compra.lote.codigo if compra.lote else None, nota=compra.nota,
+    )
+
+
+def cargar_compra(db: Session, compra_id: int, bloquear: bool = False) -> CompraSugerida:
+    consulta = db.query(CompraSugerida).filter(CompraSugerida.id == compra_id)
+    if bloquear:
+        consulta = consulta.with_for_update()
+    compra = consulta.first()
+    if compra is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Compra no encontrada")
+    return compra
+
+
+def exigir_estado_compra(compra: CompraSugerida, esperado: CompraEstado) -> None:
+    if compra.estado != esperado:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"La compra está en «{compra.estado.value}»; para esta acción debe estar en «{esperado.value}»",
+        )
+
+
+# ===========================================================================
+# MÓDULO: COMPRAS
+# ===========================================================================
+@app.post("/compras/generar", response_model=List[CompraOut], tags=["compras"])
+def generar_compras(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Revisa todo el catálogo y sugiere compras para los productos con stock bajo.
+    (El sistema también lo hace solo cada vez que un pedido baja el stock.)"""
+    nuevas = sugerir_compras(db)
+    db.commit()
+    stock = stock_por_producto(db)
+    return [compra_a_out(c, stock) for c in nuevas]
+
+
+@app.get("/compras", response_model=List[CompraOut], tags=["compras"])
+def listar_compras(
+    estado: Optional[CompraEstado] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*PERSONAL_DE_BODEGA)),
+):
+    consulta = db.query(CompraSugerida)
+    if estado is not None:
+        consulta = consulta.filter(CompraSugerida.estado == estado)
+    stock = stock_por_producto(db)
+    return [compra_a_out(c, stock) for c in consulta.order_by(CompraSugerida.id.desc()).all()]
+
+
+@app.get("/compras/atrasadas", response_model=List[CompraOut], tags=["compras"])
+def compras_atrasadas(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Mercancía atrasada: compras aprobadas cuya fecha estimada ya pasó sin que llegara."""
+    stock = stock_por_producto(db)
+    aprobadas = db.query(CompraSugerida).filter(CompraSugerida.estado == CompraEstado.aprobada).all()
+    salida = [compra_a_out(c, stock) for c in aprobadas]
+    return sorted((c for c in salida if c.atrasada), key=lambda c: c.dias_atraso, reverse=True)
+
+
+@app.get("/compras/{compra_id}", response_model=CompraOut, tags=["compras"])
+def ver_compra(
+    compra_id: int,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*PERSONAL_DE_BODEGA)),
+):
+    return compra_a_out(cargar_compra(db, compra_id), stock_por_producto(db))
+
+
+@app.post("/compras/{compra_id}/aprobar", response_model=CompraOut, tags=["compras"])
+def aprobar_compra(
+    compra_id: int,
+    datos: Optional[AprobarCompraIn] = None,
+    db: Session = Depends(get_db),
+    gerente: Usuario = Depends(requiere_roles(Rol.gerente)),
+):
+    """Aprobación con un toque. Queda la fecha estimada de llegada (hoy + plazo de compra).
+    Es un registro interno: la app no se comunica con el proveedor."""
+    compra = cargar_compra(db, compra_id, bloquear=True)
+    exigir_estado_compra(compra, CompraEstado.sugerida)
+    ahora = datetime.now(timezone.utc)
+    compra.estado = CompraEstado.aprobada
+    compra.aprobada_por_id = gerente.id
+    compra.fecha_aprobacion = ahora
+    compra.fecha_estimada = ahora + timedelta(days=obtener_plazo_compra(db))
+    if datos and datos.proveedor:
+        compra.proveedor = datos.proveedor.strip() or None
+    db.commit()
+    db.refresh(compra)
+    return compra_a_out(compra, stock_por_producto(db))
+
+
+@app.post("/compras/{compra_id}/rechazar", response_model=CompraOut, tags=["compras"])
+def rechazar_compra(
+    compra_id: int,
+    datos: Optional[RechazarCompraIn] = None,
+    db: Session = Depends(get_db),
+    gerente: Usuario = Depends(requiere_roles(Rol.gerente)),
+):
+    compra = cargar_compra(db, compra_id, bloquear=True)
+    exigir_estado_compra(compra, CompraEstado.sugerida)
+    compra.estado = CompraEstado.rechazada
+    compra.aprobada_por_id = gerente.id
+    compra.nota = (datos.nota or "").strip() or None if datos else None
+    db.commit()
+    db.refresh(compra)
+    return compra_a_out(compra, stock_por_producto(db))
+
+
+@app.post("/compras/{compra_id}/recibir", response_model=CompraOut, tags=["compras"])
+def recibir_compra(
+    compra_id: int,
+    datos: RecibirCompraIn,
+    db: Session = Depends(get_db),
+    receptor: Usuario = Depends(requiere_roles(Rol.operario, Rol.gerente)),
+):
+    """Recepción con comprobación: se compara lo aprobado con lo que llegó (bueno y dañado).
+    - Si llegó todo y en buen estado: se crea el lote y el stock sube.
+    - Si hay faltantes, sobrantes o daños: la compra queda «con_diferencias» y el stock
+      queda retenido hasta que el gerente decida."""
+    compra = cargar_compra(db, compra_id, bloquear=True)
+    exigir_estado_compra(compra, CompraEstado.aprobada)
+    total = datos.cantidad_buena + datos.cantidad_danada
+    if total == 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Registra al menos una unidad recibida; si no llegó nada, la compra sigue pendiente",
+        )
+    compra.recibida_por_id = receptor.id
+    compra.fecha_recepcion = datetime.now(timezone.utc)
+    compra.cantidad_buena = datos.cantidad_buena
+    compra.cantidad_danada = datos.cantidad_danada
+
+    completa = datos.cantidad_buena == compra.cantidad_sugerida and datos.cantidad_danada == 0
+    if completa:
+        lote = crear_lote(db, compra.producto, datos.cantidad_buena, compra.producto.costo, compra.proveedor)
+        compra.lote_id = lote.id
+        compra.estado = CompraEstado.recibida
+    else:
+        compra.estado = CompraEstado.con_diferencias
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "No se pudo registrar la recepción; intenta de nuevo")
+    db.refresh(compra)
+    return compra_a_out(compra, stock_por_producto(db))
+
+
+@app.post("/compras/{compra_id}/resolver", response_model=CompraOut, tags=["compras"])
+def resolver_diferencias(
+    compra_id: int,
+    datos: ResolverCompraIn,
+    db: Session = Depends(get_db),
+    gerente: Usuario = Depends(requiere_roles(Rol.gerente)),
+):
+    """El gerente decide qué hacer con una recepción con diferencias:
+    - aceptar: se crea el lote solo con las unidades en buen estado y el stock sube.
+    - descartar: no entra nada al stock."""
+    compra = cargar_compra(db, compra_id, bloquear=True)
+    exigir_estado_compra(compra, CompraEstado.con_diferencias)
+    compra.resuelta_por_id = gerente.id
+    compra.nota = (datos.nota or "").strip() or None
+    if datos.decision == "aceptar":
+        if not compra.cantidad_buena:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "No hay unidades en buen estado para ingresar; elige «descartar»",
+            )
+        lote = crear_lote(db, compra.producto, compra.cantidad_buena, compra.producto.costo, compra.proveedor)
+        compra.lote_id = lote.id
+        compra.estado = CompraEstado.recibida
+    else:
+        compra.estado = CompraEstado.descartada
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "No se pudo guardar la decisión; intenta de nuevo")
+    db.refresh(compra)
+    return compra_a_out(compra, stock_por_producto(db))

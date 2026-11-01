@@ -1,3 +1,8 @@
+"""
+NovaTech API - models.py
+Conexión a la base de datos y tablas.
+Todo el código de datos vive en este archivo; la lógica y las rutas viven en main.py.
+"""
 import enum
 import os
 from datetime import datetime, timezone
@@ -243,3 +248,46 @@ class PedidoEvento(ModeloBase):
 
     pedido = relationship("Pedido", back_populates="eventos")
     usuario = relationship("Usuario")
+
+
+# ---------------------------------------------------------------------------
+# B4: COMPRAS SUGERIDAS Y RECEPCIÓN (registro interno; no se envía al proveedor)
+# ---------------------------------------------------------------------------
+class CompraEstado(str, enum.Enum):
+    sugerida = "sugerida"              # la generó el sistema; espera al gerente
+    aprobada = "aprobada"              # el gerente aprobó; se espera la mercancía
+    rechazada = "rechazada"            # el gerente no la aprobó
+    recibida = "recibida"              # llegó bien y el stock ya subió
+    con_diferencias = "con_diferencias"  # llegó distinto a lo aprobado; stock retenido
+    descartada = "descartada"          # el gerente decidió no ingresar lo recibido
+
+
+class CompraSugerida(ModeloBase):
+    __tablename__ = "compras"
+
+    codigo = Column(String(20), unique=True, index=True, nullable=False)    # COM-AAAA-NNNN
+    producto_id = Column(Integer, ForeignKey("productos.id"), index=True, nullable=False)
+    cantidad_sugerida = Column(Integer, nullable=False)
+    estado = Column(
+        Enum(CompraEstado, native_enum=False, length=20),
+        default=CompraEstado.sugerida,
+        index=True,
+        nullable=False,
+    )
+    proveedor = Column(String(100))            # solo un dato; no hay comunicación con el proveedor
+    aprobada_por_id = Column(Integer, ForeignKey("usuarios.id"))
+    fecha_aprobacion = Column(DateTime(timezone=True))
+    fecha_estimada = Column(DateTime(timezone=True))
+    recibida_por_id = Column(Integer, ForeignKey("usuarios.id"))
+    fecha_recepcion = Column(DateTime(timezone=True))
+    cantidad_buena = Column(Integer)
+    cantidad_danada = Column(Integer)
+    resuelta_por_id = Column(Integer, ForeignKey("usuarios.id"))
+    nota = Column(String(255))
+    lote_id = Column(Integer, ForeignKey("lotes.id"))
+
+    producto = relationship("Producto")
+    lote = relationship("Lote")
+    aprobada_por = relationship("Usuario", foreign_keys=[aprobada_por_id])
+    recibida_por = relationship("Usuario", foreign_keys=[recibida_por_id])
+    resuelta_por = relationship("Usuario", foreign_keys=[resuelta_por_id])
