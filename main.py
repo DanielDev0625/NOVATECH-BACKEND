@@ -12,7 +12,7 @@ import secrets
 import traceback
 import unicodedata
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import List, Literal, Optional
 
@@ -26,7 +26,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,11 +34,17 @@ from models import (
     ROLES_PERSONAL,
     AsignacionLote,
     Base,
+    Bitacora,
     Categoria,
     CompraEstado,
     CompraSugerida,
     Configuracion,
     Direccion,
+    Equipo,
+    HoraExtra,
+    HoraExtraEstado,
+    Horario,
+    Jornada,
     Liquidacion,
     Lote,
     LoteEstado,
@@ -52,6 +58,7 @@ from models import (
     SessionLocal,
     Usuario,
     Vehiculo,
+    Zona,
     engine,
 )
 
@@ -134,13 +141,17 @@ def verificar_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def crear_token(usuario: Usuario) -> str:
+def crear_token(usuario: Usuario, expira: Optional[datetime] = None) -> str:
+    """Token de sesión. Para el personal con jornada, `expira` es la hora de salida (o el fin de las horas extra aprobadas)."""
     ahora = datetime.now(timezone.utc)
+    vence = ahora + timedelta(hours=TOKEN_HORAS)
+    if expira is not None:
+        vence = min(vence, expira)
     payload = {
         "sub": str(usuario.id),
         "rol": usuario.rol.value,
         "iat": ahora,
-        "exp": ahora + timedelta(hours=TOKEN_HORAS),
+        "exp": vence,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITMO)
 
@@ -163,6 +174,14 @@ def usuario_actual(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sesión inválida o vencida")
     if usuario is None or not usuario.activo:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Cuenta inexistente o desactivada")
+    if usuario.rol in ROLES_CON_JORNADA:
+        try:
+            registrar_actividad(db, usuario)
+        except HTTPException:
+            raise
+        except Exception:
+            db.rollback()
+            traceback.print_exc()
     return usuario
 
 
@@ -331,6 +350,8 @@ class LoteOut(BaseModel):
 # ===========================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if JWT_SECRET == "cambia-esto-en-vercel":
+        print("ADVERTENCIA: JWT_SECRET sigue con el valor de ejemplo; define uno propio en las variables de entorno.")
     try:
         crear_tablas_y_admin()
     except Exception:
@@ -339,7 +360,12 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="NovaTech API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(
+    title="NovaTech API",
+    version="1.0.0",
+    description="Trazabilidad, logística y eficiencia energética para una distribuidora de componentes de PC.",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -355,6 +381,17 @@ def estado():
     return {"servicio": "NovaTech API", "version": app.version, "estado": "ok"}
 
 
+@app.get("/salud", tags=["estado"])
+def salud(db: Session = Depends(get_db)):
+    """Comprueba que la API y la base de datos responden (útil para revisar el despliegue en Vercel)."""
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "No hay conexión con la base de datos")
+    return {"estado": "ok", "base_de_datos": "ok"}
+
+
 # ===========================================================================
 # MÓDULO: AUTH
 # ===========================================================================
@@ -368,7 +405,8 @@ def login_personal(datos: LoginIn, db: Session = Depends(get_db)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cuenta desactivada")
     if not usuario.es_personal:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Esta cuenta no pertenece al personal")
-    return TokenOut(access_token=crear_token(usuario), usuario=usuario)
+    expira = resolver_sesion(db, usuario)    # None para gerente y administrador
+    return TokenOut(access_token=crear_token(usuario, expira), usuario=usuario)
 
 
 @app.get("/auth/perfil", response_model=UsuarioOut, tags=["auth"])
@@ -611,7 +649,21 @@ def ver_configuracion(
             "plazo_compra_dias": obtener_plazo_compra(db),
             "tarifa_entrega": float(obtener_tarifa_entrega(db)),
             "comision_porcentaje": float(obtener_comision(db)),
-            "bodega": dict(zip(("latitud", "longitud"), obtener_bodega(db)))}
+            "bodega": dict(zip(("latitud", "longitud"), obtener_bodega(db))),
+            "jornada": {
+                "hora_inicio": obtener_config(db, "jornada_inicio", JORNADA_INICIO_POR_DEFECTO),
+                "hora_salida": obtener_config(db, "jornada_salida", JORNADA_SALIDA_POR_DEFECTO),
+                "tope_horas_extra": float(obtener_tope_extra(db)),
+            },
+            "energia": {
+                "tarifa_kwh": float(obtener_tarifa_kwh(db)),
+                "factor_co2": float(obtener_factor_co2(db)),
+                "aumento_alerta_porcentaje": float(obtener_alerta_aumento(db)),
+            },
+            "etapas_esperadas_minutos": {
+                "alistamiento": obtener_etapa_esperada(db, "alistamiento"),
+                "ruta": obtener_etapa_esperada(db, "ruta"),
+            }}
 
 
 @app.put("/configuracion/margen", tags=["configuracion"])
@@ -2606,3 +2658,1440 @@ def pagar_liquidaciones(
     db.commit()
     return {"transportista_id": datos.transportista_id, "liquidaciones_pagadas": len(pendientes),
             "total_pagado": float(total)}
+
+
+# ===========================================================================
+# B6: CONSTANTES Y ESQUEMAS DE JORNADA, HORAS EXTRA Y ENERGÍA
+# ===========================================================================
+TZ_COLOMBIA = timezone(timedelta(hours=-5))      # Colombia no usa horario de verano
+ROLES_CON_JORNADA = (Rol.operario, Rol.transportista)   # gerente y administrador no tienen restricción de horario
+ANTICIPACION_MINUTOS = 60                        # se puede iniciar sesión hasta 1 hora antes del inicio
+AVISO_SALIDA_MINUTOS = 10
+
+JORNADA_INICIO_POR_DEFECTO = "08:00"             # valores provisionales: se definen con la distribuidora
+JORNADA_SALIDA_POR_DEFECTO = "17:00"
+TOPE_HORAS_EXTRA_POR_DEFECTO = Decimal("3")
+TARIFA_KWH_POR_DEFECTO = Decimal("850")          # valores de ejemplo del código de consola
+FACTOR_CO2_POR_DEFECTO = Decimal("0.164")
+ALERTA_AUMENTO_POR_DEFECTO = Decimal("20")
+
+PATRON_HORA = r"^([01]\d|2[0-3]):[0-5]\d$"
+MotivoHoraExtra = Literal["pedidos_urgentes", "inventario", "mercancia_por_recibir", "apoyo_logistica", "otro"]
+
+
+class HorarioIn(BaseModel):
+    hora_inicio: str = Field(pattern=PATRON_HORA)
+    hora_salida: str = Field(pattern=PATRON_HORA)
+
+    @field_validator("hora_salida")
+    @classmethod
+    def salida_despues_de_inicio(cls, v, info):
+        inicio = info.data.get("hora_inicio")
+        if inicio and v <= inicio:
+            raise ValueError("La hora de salida debe ser después de la hora de inicio")
+        return v
+
+
+class HorarioOut(BaseModel):
+    usuario_id: int
+    nombre: str
+    rol: Rol
+    hora_inicio: str
+    hora_salida: str
+    personalizado: bool        # false = usa el horario por defecto de la empresa
+
+
+class JornadaConfigIn(BaseModel):
+    hora_inicio: str = Field(pattern=PATRON_HORA)
+    hora_salida: str = Field(pattern=PATRON_HORA)
+    tope_horas_extra: float = Field(gt=0, le=12)
+
+    @field_validator("hora_salida")
+    @classmethod
+    def salida_despues_de_inicio(cls, v, info):
+        inicio = info.data.get("hora_inicio")
+        if inicio and v <= inicio:
+            raise ValueError("La hora de salida debe ser después de la hora de inicio")
+        return v
+
+
+class JornadaOut(BaseModel):
+    id: int
+    usuario_id: int
+    usuario: str
+    fecha: date
+    inicio_programado: datetime
+    salida_programada: datetime
+    entrada_real: Optional[datetime]
+    ultima_actividad: Optional[datetime]
+    salida_real: Optional[datetime]
+    horas_normales: float
+    horas_extra: float
+    estado: Literal["en_curso", "normal", "con_horas_extra", "salida_no_registrada"]
+
+
+class JornadaHoyOut(BaseModel):
+    fecha: date
+    hora_inicio: str
+    hora_salida: str
+    entrada_real: Optional[datetime]
+    hora_extra_aprobada_hasta: Optional[str]
+    sesion_hasta: datetime
+    minutos_para_salida: int
+    aviso_salida: bool         # true en los últimos 10 minutos: «tu jornada termina en 10 minutos»
+
+
+class ProgramarHorasExtraIn(BaseModel):
+    usuario_ids: List[int] = Field(min_length=1, max_length=50)
+    fechas: List[date] = Field(min_length=1, max_length=14)
+    hora_fin: str = Field(pattern=PATRON_HORA)
+
+
+class SolicitarHoraExtraIn(BaseModel):
+    fecha: date
+    hora_fin: str = Field(pattern=PATRON_HORA)
+    motivo: MotivoHoraExtra
+
+
+class HoraExtraOut(BaseModel):
+    id: int
+    usuario_id: int
+    usuario: str
+    fecha: date
+    hora_fin: str
+    estado: HoraExtraEstado
+    motivo: Optional[str]
+    es_correccion: bool
+    resuelta_por: Optional[str]
+
+
+class BitacoraOut(BaseModel):
+    id: int
+    fecha: Optional[datetime]
+    usuario: Optional[str]
+    accion: str
+    detalle: Optional[str]
+
+
+class EnergiaConfigIn(BaseModel):
+    tarifa_kwh: float = Field(gt=0, le=1_000_000)           # debe ser mayor que cero
+    factor_co2: float = Field(ge=0, le=5)                   # kg de CO2 por kWh
+    aumento_alerta_porcentaje: float = Field(ge=0, le=1000)
+
+
+class ZonaCrear(BaseModel):
+    nombre: str = Field(min_length=2, max_length=80)
+    umbral_kwh_mensual: Optional[float] = Field(default=None, gt=0)
+
+
+class EquipoCrear(BaseModel):
+    zona_id: int
+    nombre: str = Field(min_length=2, max_length=100)
+    potencia_kw: float = Field(gt=0, le=10000)
+    tipo: Literal["jornada", "continuo"]
+
+
+class EquipoOut(BaseModel):
+    id: int
+    nombre: str
+    potencia_kw: float
+    tipo: str
+    activo: bool
+
+
+class ZonaOut(BaseModel):
+    id: int
+    nombre: str
+    umbral_kwh_mensual: Optional[float]
+    potencia_total_kw: float
+    equipos: List[EquipoOut]
+
+
+class ConsumoZonaOut(BaseModel):
+    zona_id: int
+    zona: str
+    kwh_jornada: float
+    kwh_continuo: float
+    kwh: float
+    costo: float
+    co2_kg: float
+
+
+class ConsumoDiaOut(BaseModel):
+    fecha: date
+    hubo_jornada: bool
+    horas_normales: float
+    horas_extra: float
+    kwh: float
+    costo: float
+    co2_kg: float
+
+
+class ConsumoOut(BaseModel):
+    desde: date
+    hasta: date
+    tarifa_kwh: float
+    factor_co2: float
+    zonas: List[ConsumoZonaOut]
+    diario: List[ConsumoDiaOut]
+    total_kwh: float
+    total_costo: float
+    total_co2_kg: float
+    pedidos_despachados: int
+    kwh_por_pedido: Optional[float]      # indicador propio: la bodega trabaja en función de los despachos
+
+
+class AlertaEnergiaOut(BaseModel):
+    zona: str
+    tipo: Literal["umbral", "aumento"]
+    mensaje: str
+    kwh_mes_actual: float
+    referencia: float
+
+
+class EstadoEquipoIn(BaseModel):
+    activo: bool
+
+
+# ===========================================================================
+# TIEMPO Y CONFIGURACIÓN DE JORNADA
+# ===========================================================================
+def ahora_local() -> datetime:
+    return datetime.now(TZ_COLOMBIA)
+
+
+def con_zona(momento: Optional[datetime]) -> Optional[datetime]:
+    """Las bases de datos a veces devuelven fechas sin zona horaria; se asume UTC."""
+    if momento is None:
+        return None
+    return momento.replace(tzinfo=timezone.utc) if momento.tzinfo is None else momento
+
+
+def combinar_fecha_hora(fecha: date, hhmm: str) -> datetime:
+    hora, minuto = (int(x) for x in hhmm.split(":"))
+    return datetime(fecha.year, fecha.month, fecha.day, hora, minuto, tzinfo=TZ_COLOMBIA)
+
+
+def horas_entre(inicio: datetime, fin: datetime) -> float:
+    return (fin - inicio).total_seconds() / 3600
+
+
+def lunes_de(fecha: date) -> date:
+    return fecha - timedelta(days=fecha.weekday())
+
+
+def obtener_tope_extra(db: Session) -> Decimal:
+    return _decimal_config(db, "tope_horas_extra", TOPE_HORAS_EXTRA_POR_DEFECTO)
+
+
+def obtener_tarifa_kwh(db: Session) -> Decimal:
+    return _decimal_config(db, "tarifa_kwh", TARIFA_KWH_POR_DEFECTO)
+
+
+def obtener_factor_co2(db: Session) -> Decimal:
+    return _decimal_config(db, "factor_co2", FACTOR_CO2_POR_DEFECTO)
+
+
+def obtener_alerta_aumento(db: Session) -> Decimal:
+    return _decimal_config(db, "alerta_aumento_porcentaje", ALERTA_AUMENTO_POR_DEFECTO)
+
+
+def horario_por_defecto(db: Session) -> tuple:
+    return (
+        obtener_config(db, "jornada_inicio", JORNADA_INICIO_POR_DEFECTO),
+        obtener_config(db, "jornada_salida", JORNADA_SALIDA_POR_DEFECTO),
+    )
+
+
+def horario_efectivo(db: Session, usuario_id: int) -> tuple:
+    """Horario de la persona; si no tiene uno propio, el de la empresa."""
+    horario = db.query(Horario).filter(Horario.usuario_id == usuario_id).first()
+    if horario is not None:
+        return horario.hora_inicio, horario.hora_salida
+    return horario_por_defecto(db)
+
+
+def registrar_bitacora(db: Session, usuario_id: Optional[int], accion: str, detalle: str) -> None:
+    db.add(Bitacora(usuario_id=usuario_id, accion=accion, detalle=detalle[:255]))
+
+
+# ===========================================================================
+# CÁLCULO DE HORAS (reglas del documento)
+# ===========================================================================
+def calcular_horas_jornada(inicio_prog: datetime, salida_prog: datetime,
+                           ultima_actividad: Optional[datetime], salida_real: Optional[datetime],
+                           extra_fin: Optional[datetime], es_correccion: bool,
+                           tope_horas: float, ahora: datetime) -> dict:
+    """Horas normales, horas extra y estado de una jornada.
+    - Sale a la hora o antes: solo horas normales.
+    - Olvida cerrar y no hay actividad después de la salida: 0 horas extra y queda «salida_no_registrada».
+    - Trabaja después de la salida con horas extra aprobadas: cuentan hasta su última actividad real
+      (y hasta la hora aprobada), con tope diario.
+    - Una corrección aprobada cuenta hasta la hora aprobada, sin exigir actividad (la decide el gerente)."""
+    fin_normal = min(salida_real, salida_prog) if salida_real else min(ahora, salida_prog)
+    normales = max(horas_entre(inicio_prog, fin_normal), 0.0)
+
+    extra = 0.0
+    if extra_fin is not None and extra_fin > salida_prog:
+        if es_correccion:
+            limite = extra_fin
+        elif ultima_actividad is not None:
+            limite = min(extra_fin, ultima_actividad)
+            if salida_real is not None:
+                limite = min(limite, salida_real)
+        else:
+            limite = salida_prog
+        extra = min(max(horas_entre(salida_prog, limite), 0.0), tope_horas)
+
+    if extra > 0:
+        estado = "con_horas_extra"
+    elif salida_real is None and ahora >= salida_prog:
+        estado = "salida_no_registrada"
+    elif salida_real is None:
+        estado = "en_curso"
+    else:
+        estado = "normal"
+    return {"horas_normales": round(normales, 2), "horas_extra": round(extra, 2), "estado": estado}
+
+
+def extras_aprobadas(db: Session, desde: date, hasta: date, usuario_id: Optional[int] = None) -> dict:
+    consulta = db.query(HoraExtra).filter(
+        HoraExtra.estado == HoraExtraEstado.aprobada, HoraExtra.fecha >= desde, HoraExtra.fecha <= hasta,
+    )
+    if usuario_id is not None:
+        consulta = consulta.filter(HoraExtra.usuario_id == usuario_id)
+    return {(h.usuario_id, h.fecha): h for h in consulta.all()}
+
+
+def calcular_jornada_guardada(j: Jornada, extras: dict, tope: Decimal, ahora: datetime) -> dict:
+    extra = extras.get((j.usuario_id, j.fecha))
+    return calcular_horas_jornada(
+        con_zona(j.inicio_programado), con_zona(j.salida_programada),
+        con_zona(j.ultima_actividad), con_zona(j.salida_real),
+        combinar_fecha_hora(j.fecha, extra.hora_fin) if extra else None,
+        bool(extra and extra.es_correccion), float(tope), ahora,
+    )
+
+
+def jornada_a_out(j: Jornada, extras: dict, tope: Decimal, ahora: datetime) -> JornadaOut:
+    calculo = calcular_jornada_guardada(j, extras, tope, ahora)
+    return JornadaOut(
+        id=j.id, usuario_id=j.usuario_id, usuario=j.usuario.nombre, fecha=j.fecha,
+        inicio_programado=j.inicio_programado, salida_programada=j.salida_programada,
+        entrada_real=j.entrada_real, ultima_actividad=j.ultima_actividad, salida_real=j.salida_real,
+        horas_normales=calculo["horas_normales"], horas_extra=calculo["horas_extra"], estado=calculo["estado"],
+    )
+
+
+# ===========================================================================
+# SESIÓN POR JORNADA: la sesión caduca sola a la hora de salida
+# ===========================================================================
+def limite_de_sesion(db: Session, usuario_id: int, hoy: date) -> tuple:
+    """(salida programada, fin de horas extra aprobadas o None, hasta cuándo dura la sesión)."""
+    _, hora_salida = horario_efectivo(db, usuario_id)
+    salida = combinar_fecha_hora(hoy, hora_salida)
+    extra = db.query(HoraExtra).filter(
+        HoraExtra.usuario_id == usuario_id, HoraExtra.fecha == hoy,
+        HoraExtra.estado == HoraExtraEstado.aprobada,
+    ).first()
+    fin_extra = combinar_fecha_hora(hoy, extra.hora_fin) if extra else None
+    limite = max(salida, fin_extra) if fin_extra else salida
+    return salida, fin_extra, limite
+
+
+def jornada_de_hoy(db: Session, usuario_id: int, hoy: date) -> Optional[Jornada]:
+    return db.query(Jornada).filter(Jornada.usuario_id == usuario_id, Jornada.fecha == hoy).first()
+
+
+def resolver_sesion(db: Session, usuario: Usuario) -> Optional[datetime]:
+    """Al iniciar sesión: decide si la persona puede entrar y hasta cuándo dura su sesión.
+    Devuelve None si el rol no tiene restricción de horario."""
+    if usuario.rol not in ROLES_CON_JORNADA:
+        return None
+    ahora = ahora_local()
+    hoy = ahora.date()
+    hora_inicio, hora_salida = horario_efectivo(db, usuario.id)
+    inicio = combinar_fecha_hora(hoy, hora_inicio)
+    salida, fin_extra, limite = limite_de_sesion(db, usuario.id, hoy)
+
+    mensaje = None
+    if ahora >= limite:
+        if fin_extra is not None:
+            mensaje = "Tu horario de hoy ya terminó"
+        else:
+            semana = lunes_de(hoy)
+            hay_en_la_semana = db.query(HoraExtra).filter(
+                HoraExtra.usuario_id == usuario.id, HoraExtra.estado == HoraExtraEstado.aprobada,
+                HoraExtra.fecha >= semana, HoraExtra.fecha <= semana + timedelta(days=6),
+            ).first()
+            mensaje = ("No tienes horas extra aprobadas para hoy" if hay_en_la_semana
+                       else "No estás programado para horas extra esta semana")
+    elif ahora < inicio - timedelta(minutes=ANTICIPACION_MINUTOS):
+        mensaje = f"Tu jornada empieza a las {hora_inicio}"
+
+    if mensaje:
+        registrar_bitacora(db, usuario.id, "intento_fuera_de_horario", f"{mensaje} ({ahora:%Y-%m-%d %H:%M})")
+        db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, mensaje)
+
+    jornada = jornada_de_hoy(db, usuario.id, hoy)
+    if jornada is None:
+        jornada = Jornada(
+            usuario_id=usuario.id, fecha=hoy, entrada_real=ahora,
+            inicio_programado=inicio, salida_programada=salida,
+        )
+        db.add(jornada)
+    else:
+        jornada.inicio_programado = inicio       # si el horario cambió, se usa el de hoy
+        jornada.salida_programada = salida
+        jornada.salida_real = None               # volvió a entrar
+    jornada.ultima_actividad = ahora
+    db.commit()
+    return limite
+
+
+def registrar_actividad(db: Session, usuario: Usuario) -> None:
+    """Deja la hora de la última actividad real (como mucho una vez por minuto).
+    Si la persona ya cerró su jornada, la sesión deja de servir."""
+    ahora = ahora_local()
+    jornada = jornada_de_hoy(db, usuario.id, ahora.date())
+    if jornada is None:
+        return
+    if jornada.salida_real is not None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Cerraste tu jornada; inicia sesión de nuevo")
+    ultima = con_zona(jornada.ultima_actividad)
+    if ultima is None or (ahora - ultima).total_seconds() >= 60:
+        jornada.ultima_actividad = ahora
+        db.commit()
+
+
+# ===========================================================================
+# MÓDULO: HORARIOS Y CONFIGURACIÓN DE LA JORNADA
+# ===========================================================================
+@app.put("/configuracion/jornada", tags=["configuracion"])
+def cambiar_jornada_por_defecto(
+    datos: JornadaConfigIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Horario de la empresa (lo usa quien no tenga uno propio) y tope diario de horas extra."""
+    guardar_config(db, "jornada_inicio", datos.hora_inicio)
+    guardar_config(db, "jornada_salida", datos.hora_salida)
+    guardar_config(db, "tope_horas_extra", str(Decimal(str(datos.tope_horas_extra))))
+    db.commit()
+    return {"hora_inicio": datos.hora_inicio, "hora_salida": datos.hora_salida,
+            "tope_horas_extra": datos.tope_horas_extra}
+
+
+@app.get("/horarios", response_model=List[HorarioOut], tags=["jornada"])
+def listar_horarios(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    personal = (
+        db.query(Usuario)
+        .filter(Usuario.rol.in_(ROLES_CON_JORNADA), Usuario.activo.is_(True))
+        .order_by(Usuario.nombre)
+        .all()
+    )
+    propios = {h.usuario_id: h for h in db.query(Horario).all()}
+    por_defecto = horario_por_defecto(db)
+    salida = []
+    for u in personal:
+        h = propios.get(u.id)
+        inicio, fin = (h.hora_inicio, h.hora_salida) if h else por_defecto
+        salida.append(HorarioOut(
+            usuario_id=u.id, nombre=u.nombre, rol=u.rol,
+            hora_inicio=inicio, hora_salida=fin, personalizado=h is not None,
+        ))
+    return salida
+
+
+@app.put("/horarios/{usuario_id}", response_model=HorarioOut, tags=["jornada"])
+def configurar_horario(
+    usuario_id: int,
+    datos: HorarioIn,
+    db: Session = Depends(get_db),
+    quien: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """El administrador o el gerente fijan la hora de inicio y de salida de una persona."""
+    persona = db.get(Usuario, usuario_id)
+    if persona is None or not persona.activo or persona.rol not in ROLES_CON_JORNADA:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Operario o transportista no encontrado")
+    horario = db.query(Horario).filter(Horario.usuario_id == usuario_id).first()
+    if horario is None:
+        db.add(Horario(usuario_id=usuario_id, hora_inicio=datos.hora_inicio, hora_salida=datos.hora_salida))
+    else:
+        horario.hora_inicio = datos.hora_inicio
+        horario.hora_salida = datos.hora_salida
+    registrar_bitacora(db, quien.id, "horario_configurado",
+                       f"{persona.nombre}: {datos.hora_inicio} a {datos.hora_salida}")
+    db.commit()
+    return HorarioOut(
+        usuario_id=persona.id, nombre=persona.nombre, rol=persona.rol,
+        hora_inicio=datos.hora_inicio, hora_salida=datos.hora_salida, personalizado=True,
+    )
+
+
+# ===========================================================================
+# MÓDULO: JORNADA (operario y transportista)
+# ===========================================================================
+@app.post("/auth/salir", tags=["auth"])
+def salir(db: Session = Depends(get_db), usuario: Usuario = Depends(usuario_actual)):
+    """Cierra la jornada de hoy con el botón «salir». Sin este registro, la jornada queda
+    «salida_no_registrada» y no cuentan horas extra."""
+    if usuario.rol not in ROLES_CON_JORNADA:
+        return {"ok": True}
+    ahora = ahora_local()
+    jornada = jornada_de_hoy(db, usuario.id, ahora.date())
+    if jornada is not None:
+        jornada.salida_real = ahora
+        jornada.ultima_actividad = ahora
+        db.commit()
+    return {"ok": True, "salida": ahora}
+
+
+@app.get("/jornada/hoy", response_model=JornadaHoyOut, tags=["jornada"])
+def jornada_hoy(
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(requiere_roles(*ROLES_CON_JORNADA)),
+):
+    """«Mi jornada»: horario de hoy, horas extra aprobadas y el aviso de los 10 minutos antes de la salida."""
+    ahora = ahora_local()
+    hoy = ahora.date()
+    hora_inicio, hora_salida = horario_efectivo(db, usuario.id)
+    _, fin_extra, limite = limite_de_sesion(db, usuario.id, hoy)
+    jornada = jornada_de_hoy(db, usuario.id, hoy)
+    minutos = max(int((limite - ahora).total_seconds() // 60), 0)
+    return JornadaHoyOut(
+        fecha=hoy, hora_inicio=hora_inicio, hora_salida=hora_salida,
+        entrada_real=jornada.entrada_real if jornada else None,
+        hora_extra_aprobada_hasta=fin_extra.strftime("%H:%M") if fin_extra else None,
+        sesion_hasta=limite, minutos_para_salida=minutos,
+        aviso_salida=0 < minutos <= AVISO_SALIDA_MINUTOS,
+    )
+
+
+@app.get("/jornada/mias", response_model=List[JornadaOut], tags=["jornada"])
+def mis_jornadas(
+    dias: int = 14,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(requiere_roles(*ROLES_CON_JORNADA)),
+):
+    dias = max(1, min(dias, 60))
+    ahora = ahora_local()
+    desde = ahora.date() - timedelta(days=dias)
+    extras = extras_aprobadas(db, desde, ahora.date(), usuario.id)
+    tope = obtener_tope_extra(db)
+    filas = (
+        db.query(Jornada)
+        .filter(Jornada.usuario_id == usuario.id, Jornada.fecha >= desde)
+        .order_by(Jornada.fecha.desc())
+        .all()
+    )
+    return [jornada_a_out(j, extras, tope, ahora) for j in filas]
+
+
+@app.get("/jornadas", response_model=List[JornadaOut], tags=["jornada"])
+def listar_jornadas(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    usuario_id: Optional[int] = None,
+    estado: Optional[Literal["en_curso", "normal", "con_horas_extra", "salida_no_registrada"]] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Vista de gerencia: jornadas por día, con las que quedaron «salida_no_registrada»."""
+    ahora = ahora_local()
+    hasta = hasta or ahora.date()
+    desde = desde or (hasta - timedelta(days=7))
+    if desde > hasta or (hasta - desde).days > 366:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Rango de fechas no válido (máximo 366 días)")
+    consulta = db.query(Jornada).filter(Jornada.fecha >= desde, Jornada.fecha <= hasta)
+    if usuario_id is not None:
+        consulta = consulta.filter(Jornada.usuario_id == usuario_id)
+    extras = extras_aprobadas(db, desde, hasta, usuario_id)
+    tope = obtener_tope_extra(db)
+    salida = [jornada_a_out(j, extras, tope, ahora) for j in consulta.order_by(Jornada.fecha.desc(), Jornada.id).all()]
+    if estado is not None:
+        salida = [j for j in salida if j.estado == estado]
+    return salida
+
+
+# ===========================================================================
+# MÓDULO: HORAS EXTRA (se programan por semana; solo cuentan con aprobación del gerente)
+# ===========================================================================
+def hora_extra_a_out(h: HoraExtra) -> HoraExtraOut:
+    return HoraExtraOut(
+        id=h.id, usuario_id=h.usuario_id, usuario=h.usuario.nombre, fecha=h.fecha, hora_fin=h.hora_fin,
+        estado=h.estado, motivo=h.motivo, es_correccion=h.es_correccion,
+        resuelta_por=h.resuelta_por.nombre if h.resuelta_por else None,
+    )
+
+
+def validar_hora_fin(db: Session, usuario_id: int, fecha: date, hora_fin: str) -> None:
+    """La hora de fin debe ser posterior a la salida y no superar el tope diario."""
+    _, hora_salida = horario_efectivo(db, usuario_id)
+    if hora_fin <= hora_salida:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"La hora de fin debe ser después de la hora de salida ({hora_salida})",
+        )
+    tope = obtener_tope_extra(db)
+    horas = horas_entre(combinar_fecha_hora(fecha, hora_salida), combinar_fecha_hora(fecha, hora_fin))
+    if horas > float(tope):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"El tope es de {tope} horas extra por día",
+        )
+
+
+@app.post("/horas-extra/programar", response_model=List[HoraExtraOut], tags=["horas-extra"])
+def programar_horas_extra(
+    datos: ProgramarHorasExtraIn,
+    db: Session = Depends(get_db),
+    gerente: Usuario = Depends(requiere_roles(Rol.gerente)),
+):
+    """El gerente programa con selectores: personas, días y hora de fin. Queda aprobado de una vez.
+    La programación de cada semana vence el domingo a medianoche y no se copia a la siguiente."""
+    hoy = ahora_local().date()
+    maximo = lunes_de(hoy) + timedelta(days=13)      # hasta el domingo de la próxima semana
+    fechas = sorted(set(datos.fechas))
+    for fecha in fechas:
+        if fecha < hoy or fecha > maximo:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Solo se programan días desde hoy hasta el domingo de la próxima semana",
+            )
+    ids = sorted(set(datos.usuario_ids))
+    personal = {u.id: u for u in db.query(Usuario).filter(Usuario.id.in_(ids)).all()}
+    for uid in ids:
+        persona = personal.get(uid)
+        if persona is None or not persona.activo or persona.rol not in ROLES_CON_JORNADA:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"El usuario {uid} no es un operario ni un transportista activo")
+
+    resultado = []
+    for uid in ids:
+        for fecha in fechas:
+            validar_hora_fin(db, uid, fecha, datos.hora_fin)
+            existente = db.query(HoraExtra).filter(HoraExtra.usuario_id == uid, HoraExtra.fecha == fecha).first()
+            if existente is None:
+                existente = HoraExtra(usuario_id=uid, fecha=fecha, hora_fin=datos.hora_fin)
+                db.add(existente)
+            existente.hora_fin = datos.hora_fin
+            existente.estado = HoraExtraEstado.aprobada
+            existente.es_correccion = False
+            existente.creada_por_id = existente.creada_por_id or gerente.id
+            existente.resuelta_por_id = gerente.id
+            resultado.append(existente)
+            registrar_bitacora(db, gerente.id, "horas_extra_programadas",
+                               f"{personal[uid].nombre} el {fecha} hasta las {datos.hora_fin}")
+    db.commit()
+    for h in resultado:
+        db.refresh(h)
+    return [hora_extra_a_out(h) for h in resultado]
+
+
+@app.post("/horas-extra/solicitar", response_model=HoraExtraOut, status_code=201, tags=["horas-extra"])
+def solicitar_hora_extra(
+    datos: SolicitarHoraExtraIn,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(requiere_roles(*ROLES_CON_JORNADA)),
+):
+    """Solicitud con motivo de una lista fija y hora con selector; la aprueba el gerente con un toque.
+    Si la fecha ya pasó (hasta 7 días atrás) es una solicitud de corrección."""
+    hoy = ahora_local().date()
+    if datos.fecha < hoy - timedelta(days=7) or datos.fecha > lunes_de(hoy) + timedelta(days=13):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Solo puedes solicitar para los últimos 7 días o hasta el domingo de la próxima semana",
+        )
+    validar_hora_fin(db, usuario.id, datos.fecha, datos.hora_fin)
+    existente = db.query(HoraExtra).filter(
+        HoraExtra.usuario_id == usuario.id, HoraExtra.fecha == datos.fecha
+    ).first()
+    if existente is not None and existente.estado == HoraExtraEstado.aprobada:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Ya tienes horas extra aprobadas ese día")
+    if existente is None:
+        existente = HoraExtra(usuario_id=usuario.id, fecha=datos.fecha, hora_fin=datos.hora_fin, creada_por_id=usuario.id)
+        db.add(existente)
+    existente.hora_fin = datos.hora_fin
+    existente.motivo = datos.motivo
+    existente.estado = HoraExtraEstado.solicitada
+    existente.es_correccion = datos.fecha < hoy
+    existente.resuelta_por_id = None
+    registrar_bitacora(db, usuario.id, "horas_extra_solicitadas",
+                       f"{datos.fecha} hasta las {datos.hora_fin} ({datos.motivo})"
+                       + (" [corrección]" if datos.fecha < hoy else ""))
+    db.commit()
+    db.refresh(existente)
+    return hora_extra_a_out(existente)
+
+
+@app.get("/horas-extra", response_model=List[HoraExtraOut], tags=["horas-extra"])
+def listar_horas_extra(
+    estado: Optional[HoraExtraEstado] = None,
+    usuario_id: Optional[int] = None,
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(requiere_roles(*TODO_PERSONAL)),
+):
+    """Gerencia y administración ven todas; operarios y transportistas solo las suyas."""
+    consulta = db.query(HoraExtra)
+    if usuario.rol in ROLES_CON_JORNADA:
+        consulta = consulta.filter(HoraExtra.usuario_id == usuario.id)
+    elif usuario_id is not None:
+        consulta = consulta.filter(HoraExtra.usuario_id == usuario_id)
+    if estado is not None:
+        consulta = consulta.filter(HoraExtra.estado == estado)
+    if desde is not None:
+        consulta = consulta.filter(HoraExtra.fecha >= desde)
+    if hasta is not None:
+        consulta = consulta.filter(HoraExtra.fecha <= hasta)
+    return [hora_extra_a_out(h) for h in consulta.order_by(HoraExtra.fecha.desc(), HoraExtra.id.desc()).all()]
+
+
+@app.post("/horas-extra/{hora_extra_id}/aprobar", response_model=HoraExtraOut, tags=["horas-extra"])
+def aprobar_hora_extra(
+    hora_extra_id: int,
+    db: Session = Depends(get_db),
+    gerente: Usuario = Depends(requiere_roles(Rol.gerente)),
+):
+    h = db.query(HoraExtra).filter(HoraExtra.id == hora_extra_id).with_for_update().first()
+    if h is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Solicitud no encontrada")
+    if h.estado != HoraExtraEstado.solicitada:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"La solicitud está «{h.estado.value}», no se puede aprobar")
+    h.estado = HoraExtraEstado.aprobada
+    h.resuelta_por_id = gerente.id
+    registrar_bitacora(db, gerente.id, "horas_extra_aprobadas", f"{h.usuario.nombre} el {h.fecha} hasta las {h.hora_fin}")
+    db.commit()
+    db.refresh(h)
+    return hora_extra_a_out(h)
+
+
+@app.post("/horas-extra/{hora_extra_id}/rechazar", response_model=HoraExtraOut, tags=["horas-extra"])
+def rechazar_hora_extra(
+    hora_extra_id: int,
+    db: Session = Depends(get_db),
+    gerente: Usuario = Depends(requiere_roles(Rol.gerente)),
+):
+    """Rechaza una solicitud, o cancela horas extra ya aprobadas que todavía no han llegado."""
+    h = db.query(HoraExtra).filter(HoraExtra.id == hora_extra_id).with_for_update().first()
+    if h is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Solicitud no encontrada")
+    if h.estado == HoraExtraEstado.rechazada:
+        raise HTTPException(status.HTTP_409_CONFLICT, "La solicitud ya estaba rechazada")
+    if h.estado == HoraExtraEstado.aprobada and h.fecha < ahora_local().date():
+        raise HTTPException(status.HTTP_409_CONFLICT, "Esas horas extra ya pasaron; no se pueden cancelar")
+    h.estado = HoraExtraEstado.rechazada
+    h.resuelta_por_id = gerente.id
+    registrar_bitacora(db, gerente.id, "horas_extra_rechazadas", f"{h.usuario.nombre} el {h.fecha}")
+    db.commit()
+    db.refresh(h)
+    return hora_extra_a_out(h)
+
+
+# ===========================================================================
+# MÓDULO: BITÁCORA (administrador)
+# ===========================================================================
+@app.get("/bitacora", response_model=List[BitacoraOut], tags=["bitacora"])
+def ver_bitacora(
+    accion: Optional[str] = None,
+    limite: int = 100,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Aprobaciones de horas extra, horarios configurados e intentos de ingreso fuera de horario."""
+    consulta = db.query(Bitacora)
+    if accion:
+        consulta = consulta.filter(Bitacora.accion == accion)
+    filas = consulta.order_by(Bitacora.id.desc()).limit(max(1, min(limite, 500))).all()
+    return [
+        BitacoraOut(
+            id=b.id, fecha=b.creado_en, usuario=b.usuario.nombre if b.usuario else None,
+            accion=b.accion, detalle=b.detalle,
+        )
+        for b in filas
+    ]
+
+
+# ===========================================================================
+# MÓDULO: EFICIENCIA ENERGÉTICA (zonas y equipos; el consumo se calcula, nadie lo digita)
+# ===========================================================================
+def zona_a_out(z: Zona) -> ZonaOut:
+    activos = [e for e in z.equipos if e.activo]
+    return ZonaOut(
+        id=z.id, nombre=z.nombre,
+        umbral_kwh_mensual=float(z.umbral_kwh_mensual) if z.umbral_kwh_mensual is not None else None,
+        potencia_total_kw=float(sum((e.potencia_kw for e in activos), Decimal("0"))),
+        equipos=[
+            EquipoOut(id=e.id, nombre=e.nombre, potencia_kw=float(e.potencia_kw), tipo=e.tipo, activo=e.activo)
+            for e in z.equipos
+        ],
+    )
+
+
+@app.put("/configuracion/energia", tags=["configuracion"])
+def cambiar_config_energia(
+    datos: EnergiaConfigIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Tarifa por kWh (mayor que cero), factor de emisión de CO2 y % de aumento que dispara una alerta."""
+    guardar_config(db, "tarifa_kwh", str(Decimal(str(datos.tarifa_kwh))))
+    guardar_config(db, "factor_co2", str(Decimal(str(datos.factor_co2))))
+    guardar_config(db, "alerta_aumento_porcentaje", str(Decimal(str(datos.aumento_alerta_porcentaje))))
+    db.commit()
+    return {"tarifa_kwh": datos.tarifa_kwh, "factor_co2": datos.factor_co2,
+            "aumento_alerta_porcentaje": datos.aumento_alerta_porcentaje}
+
+
+@app.post("/energia/zonas", response_model=ZonaOut, status_code=201, tags=["energia"])
+def crear_zona(
+    datos: ZonaCrear,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    nombre = datos.nombre.strip()
+    if db.query(Zona).filter(Zona.nombre == nombre).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe una zona con ese nombre")
+    umbral = Decimal(str(datos.umbral_kwh_mensual)) if datos.umbral_kwh_mensual else None
+    zona = Zona(nombre=nombre, umbral_kwh_mensual=umbral)
+    db.add(zona)
+    db.commit()
+    db.refresh(zona)
+    return zona_a_out(zona)
+
+
+@app.post("/energia/equipos", response_model=ZonaOut, status_code=201, tags=["energia"])
+def crear_equipo(
+    datos: EquipoCrear,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Agrega un equipo a una zona con su potencia en kW. «jornada» = solo en horas de trabajo; «continuo» = 24 h."""
+    zona = db.get(Zona, datos.zona_id)
+    if zona is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Zona no encontrada")
+    db.add(Equipo(
+        zona_id=zona.id, nombre=datos.nombre.strip(),
+        potencia_kw=Decimal(str(datos.potencia_kw)), tipo=datos.tipo,
+    ))
+    db.commit()
+    db.refresh(zona)
+    return zona_a_out(zona)
+
+
+@app.patch("/energia/equipos/{equipo_id}/estado", response_model=ZonaOut, tags=["energia"])
+def estado_equipo(
+    equipo_id: int,
+    datos: EstadoEquipoIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    equipo = db.get(Equipo, equipo_id)
+    if equipo is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Equipo no encontrado")
+    equipo.activo = datos.activo
+    db.commit()
+    db.refresh(equipo.zona)
+    return zona_a_out(equipo.zona)
+
+
+@app.get("/energia/zonas", response_model=List[ZonaOut], tags=["energia"])
+def listar_zonas(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    return [zona_a_out(z) for z in db.query(Zona).filter(Zona.activa.is_(True)).order_by(Zona.nombre).all()]
+
+
+def kwh_equipo_dia(potencia_kw, tipo: str, hubo_jornada: bool, horas_normales: float, horas_extra: float) -> Decimal:
+    """kWh de un equipo en un día: kW × horas.
+    «continuo» funciona 24 h; «jornada» solo si ese día hubo jornada: horas normales + horas extra aprobadas."""
+    potencia = Decimal(str(potencia_kw))
+    if tipo == "continuo":
+        return potencia * 24
+    if not hubo_jornada:
+        return Decimal("0")
+    return potencia * (Decimal(str(horas_normales)) + Decimal(str(horas_extra)))
+
+
+def calcular_consumo(db: Session, desde: date, hasta: date) -> dict:
+    """Consumo por zona y por día. Las horas normales son las de la jornada de la empresa;
+    las horas extra de cada día son las mayores que se aprobaron y trabajaron ese día
+    (los equipos siguen prendidos hasta que sale la última persona)."""
+    ahora = ahora_local()
+    hasta_real = min(hasta, ahora.date())          # no se calcula el futuro
+    hora_inicio, hora_salida = horario_por_defecto(db)
+    horas_normales_dia = horas_entre(
+        combinar_fecha_hora(desde, hora_inicio), combinar_fecha_hora(desde, hora_salida)
+    )
+
+    extra_por_dia = {}
+    if desde <= hasta_real:
+        extras = extras_aprobadas(db, desde, hasta_real)
+        tope = obtener_tope_extra(db)
+        jornadas = db.query(Jornada).filter(Jornada.fecha >= desde, Jornada.fecha <= hasta_real).all()
+        for j in jornadas:
+            calculo = calcular_jornada_guardada(j, extras, tope, ahora)
+            extra_por_dia[j.fecha] = max(extra_por_dia.get(j.fecha, 0.0), calculo["horas_extra"])
+
+    zonas = db.query(Zona).filter(Zona.activa.is_(True)).order_by(Zona.nombre).all()
+    acumulado = {z.id: {"nombre": z.nombre, "jornada": Decimal("0"), "continuo": Decimal("0")} for z in zonas}
+    diario = []
+    dia = desde
+    while dia <= hasta_real:
+        hubo = dia in extra_por_dia
+        extra_h = extra_por_dia.get(dia, 0.0)
+        kwh_dia = Decimal("0")
+        for z in zonas:
+            for e in z.equipos:
+                if not e.activo:
+                    continue
+                kwh = kwh_equipo_dia(e.potencia_kw, e.tipo, hubo, horas_normales_dia, extra_h)
+                acumulado[z.id]["continuo" if e.tipo == "continuo" else "jornada"] += kwh
+                kwh_dia += kwh
+        diario.append({
+            "fecha": dia, "hubo_jornada": hubo,
+            "horas_normales": round(horas_normales_dia, 2) if hubo else 0.0,
+            "horas_extra": extra_h, "kwh": kwh_dia,
+        })
+        dia += timedelta(days=1)
+    return {"zonas": acumulado, "diario": diario}
+
+
+def pedidos_despachados(db: Session, desde: date, hasta: date) -> int:
+    """Pedidos que salieron a ruta en el rango (la bodega y los montacargas trabajan en función de los despachos)."""
+    inicio = combinar_fecha_hora(desde, "00:00")
+    fin = combinar_fecha_hora(hasta + timedelta(days=1), "00:00")
+    return int(
+        db.query(func.count(func.distinct(PedidoEvento.pedido_id)))
+        .filter(PedidoEvento.estado == PedidoEstado.en_ruta,
+                PedidoEvento.creado_en >= inicio, PedidoEvento.creado_en < fin)
+        .scalar() or 0
+    )
+
+
+def _redondear(valor: Decimal, decimales: int = 2) -> float:
+    return float(valor.quantize(Decimal(1).scaleb(-decimales)))
+
+
+@app.get("/energia/consumo", response_model=ConsumoOut, tags=["energia"])
+def consumo_energia(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Consumo, costo y huella de carbono por zona y por día. Por defecto, el mes en curso."""
+    hoy = ahora_local().date()
+    hasta = hasta or hoy
+    desde = desde or hasta.replace(day=1)
+    if desde > hasta or (hasta - desde).days > 366:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Rango de fechas no válido (máximo 366 días)")
+    tarifa = obtener_tarifa_kwh(db)
+    factor = obtener_factor_co2(db)
+    if tarifa <= 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "La tarifa por kWh debe ser mayor que cero")
+
+    datos = calcular_consumo(db, desde, hasta)
+    zonas = []
+    total_kwh = Decimal("0")
+    for zona_id, z in datos["zonas"].items():
+        kwh = z["jornada"] + z["continuo"]
+        total_kwh += kwh
+        zonas.append(ConsumoZonaOut(
+            zona_id=zona_id, zona=z["nombre"],
+            kwh_jornada=_redondear(z["jornada"]), kwh_continuo=_redondear(z["continuo"]),
+            kwh=_redondear(kwh), costo=_redondear(kwh * tarifa), co2_kg=_redondear(kwh * factor),
+        ))
+    diario = [
+        ConsumoDiaOut(
+            fecha=d["fecha"], hubo_jornada=d["hubo_jornada"], horas_normales=d["horas_normales"],
+            horas_extra=d["horas_extra"], kwh=_redondear(d["kwh"]),
+            costo=_redondear(d["kwh"] * tarifa), co2_kg=_redondear(d["kwh"] * factor),
+        )
+        for d in datos["diario"]
+    ]
+    despachados = pedidos_despachados(db, desde, hasta)
+    return ConsumoOut(
+        desde=desde, hasta=hasta, tarifa_kwh=float(tarifa), factor_co2=float(factor),
+        zonas=zonas, diario=diario,
+        total_kwh=_redondear(total_kwh), total_costo=_redondear(total_kwh * tarifa),
+        total_co2_kg=_redondear(total_kwh * factor),
+        pedidos_despachados=despachados,
+        kwh_por_pedido=_redondear(total_kwh / despachados) if despachados else None,
+    )
+
+
+@app.get("/energia/alertas", response_model=List[AlertaEnergiaOut], tags=["energia"])
+def alertas_energia(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Alertas por zona: el mes supera su umbral, o el consumo diario promedio subió
+    más del porcentaje configurado frente al mes anterior."""
+    hoy = ahora_local().date()
+    inicio_mes = hoy.replace(day=1)
+    fin_mes_anterior = inicio_mes - timedelta(days=1)
+    inicio_mes_anterior = fin_mes_anterior.replace(day=1)
+    dias_actual = (hoy - inicio_mes).days + 1
+    dias_anterior = fin_mes_anterior.day
+    limite_aumento = obtener_alerta_aumento(db)
+
+    actual = calcular_consumo(db, inicio_mes, hoy)["zonas"]
+    anterior = calcular_consumo(db, inicio_mes_anterior, fin_mes_anterior)["zonas"]
+    umbrales = {z.id: z.umbral_kwh_mensual for z in db.query(Zona).filter(Zona.activa.is_(True)).all()}
+
+    alertas = []
+    for zona_id, z in actual.items():
+        kwh_actual = z["jornada"] + z["continuo"]
+        umbral = umbrales.get(zona_id)
+        if umbral is not None and kwh_actual > umbral:
+            alertas.append(AlertaEnergiaOut(
+                zona=z["nombre"], tipo="umbral",
+                mensaje=f"«{z['nombre']}» ya consumió {_redondear(kwh_actual)} kWh este mes y el umbral es {_redondear(umbral)} kWh",
+                kwh_mes_actual=_redondear(kwh_actual), referencia=_redondear(umbral),
+            ))
+        previo = anterior.get(zona_id)
+        if previo is not None:
+            kwh_previo = previo["jornada"] + previo["continuo"]
+            promedio_previo = kwh_previo / dias_anterior
+            promedio_actual = kwh_actual / dias_actual
+            if promedio_previo > 0 and promedio_actual > promedio_previo * (1 + limite_aumento / 100):
+                aumento = (promedio_actual / promedio_previo - 1) * 100
+                alertas.append(AlertaEnergiaOut(
+                    zona=z["nombre"], tipo="aumento",
+                    mensaje=f"El consumo diario de «{z['nombre']}» subió {_redondear(aumento, 1)} % frente al mes anterior",
+                    kwh_mes_actual=_redondear(kwh_actual), referencia=_redondear(kwh_previo),
+                ))
+    return alertas
+
+
+# ===========================================================================
+# B7: ESQUEMAS DE ESTADÍSTICAS
+# ===========================================================================
+ETAPA_ALISTAMIENTO_POR_DEFECTO = 60     # minutos esperados (valores provisionales)
+ETAPA_RUTA_POR_DEFECTO = 90
+
+
+class EtapasConfigIn(BaseModel):
+    alistamiento_minutos: int = Field(ge=1, le=1440)
+    ruta_minutos: int = Field(ge=1, le=1440)
+
+
+class ProductoVentaOut(BaseModel):
+    producto_id: int
+    sku: str
+    nombre: str
+    categoria: str
+    unidades: int
+    ingresos: float
+
+
+class VentasProductosOut(BaseModel):
+    desde: date
+    hasta: date
+    mas_vendido: Optional[ProductoVentaOut]
+    productos: List[ProductoVentaOut]
+
+
+class CategoriaVentaOut(BaseModel):
+    categoria: str
+    unidades: int
+    ingresos: float
+    porcentaje_ingresos: float
+
+
+class VentasCategoriasOut(BaseModel):
+    desde: date
+    hasta: date
+    total_ingresos: float
+    categorias: List[CategoriaVentaOut]
+
+
+class StockBajoOut(BaseModel):
+    producto_id: int
+    sku: str
+    nombre: str
+    categoria: str
+    stock: int
+    stock_minimo: int
+    compra: Optional[str]            # código de la reposición pendiente, si ya hay una
+    compra_estado: Optional[CompraEstado]
+
+
+class EtapaOut(BaseModel):
+    etapa: str
+    pedidos: int
+    promedio_minutos: Optional[float]
+    esperado_minutos: Optional[int]
+    porcentaje_fuera_de_plazo: Optional[float]
+
+
+class EntregasOut(BaseModel):
+    desde: date
+    hasta: date
+    entregadas: int
+    a_tiempo: int
+    tardias: int
+    porcentaje_a_tiempo: Optional[float]
+    retraso_promedio_horas: Optional[float]
+    vencidos_en_curso: int           # pedidos que ya pasaron su fecha prometida y siguen sin entregarse
+    etapas: List[EtapaOut]
+
+
+class HorasExtraPersonaOut(BaseModel):
+    usuario_id: int
+    usuario: str
+    jornadas: int
+    horas_extra: float
+    salidas_no_registradas: int
+
+
+class HorasExtraResumenOut(BaseModel):
+    desde: date
+    hasta: date
+    total_horas_extra: float
+    personas: List[HorasExtraPersonaOut]
+
+
+class PanelOut(BaseModel):
+    desde: date
+    hasta: date
+    pedidos: int
+    pedidos_por_estado: dict
+    ventas_total: float
+    unidades_vendidas: int
+    producto_mas_vendido: Optional[ProductoVentaOut]
+    entregas_a_tiempo: int
+    entregas_tardias: int
+    porcentaje_a_tiempo: Optional[float]
+    pedidos_vencidos_en_curso: int
+    productos_stock_bajo: int
+    compras_pendientes: int
+    mercancia_atrasada: int
+    jornadas_salida_no_registrada: int
+    horas_extra_total: float
+    energia_kwh: float
+    energia_costo: float
+
+
+# ===========================================================================
+# ESTADÍSTICAS: consultas reutilizables
+# ===========================================================================
+def obtener_etapa_esperada(db: Session, etapa: str) -> int:
+    defecto = ETAPA_ALISTAMIENTO_POR_DEFECTO if etapa == "alistamiento" else ETAPA_RUTA_POR_DEFECTO
+    try:
+        return int(obtener_config(db, f"etapa_{etapa}_minutos", str(defecto)))
+    except ValueError:
+        return defecto
+
+
+@app.put("/configuracion/etapas", tags=["configuracion"])
+def cambiar_etapas_esperadas(
+    datos: EtapasConfigIn,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
+):
+    """Minutos que se espera que tomen el alistamiento y la ruta; las estadísticas miden contra esto."""
+    guardar_config(db, "etapa_alistamiento_minutos", str(datos.alistamiento_minutos))
+    guardar_config(db, "etapa_ruta_minutos", str(datos.ruta_minutos))
+    db.commit()
+    return {"alistamiento_minutos": datos.alistamiento_minutos, "ruta_minutos": datos.ruta_minutos}
+
+
+def rango_periodo(desde: Optional[date], hasta: Optional[date], dias_por_defecto: int = 30) -> tuple:
+    """Devuelve (desde, hasta, inicio, fin): las fechas y los límites en hora de Colombia."""
+    hasta = hasta or ahora_local().date()
+    desde = desde or (hasta - timedelta(days=dias_por_defecto - 1))
+    if desde > hasta or (hasta - desde).days > 366:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Rango de fechas no válido (máximo 366 días)")
+    return desde, hasta, combinar_fecha_hora(desde, "00:00"), combinar_fecha_hora(hasta + timedelta(days=1), "00:00")
+
+
+def ventas_por_producto(db: Session, inicio: datetime, fin: datetime, limite: Optional[int] = None) -> List[ProductoVentaOut]:
+    """Ventas = pedidos no cancelados creados en el período."""
+    unidades = func.sum(PedidoDetalle.cantidad)
+    ingresos = func.sum(PedidoDetalle.cantidad * PedidoDetalle.precio_unitario)
+    consulta = (
+        db.query(Producto.id, Producto.sku, Producto.nombre, Categoria.nombre, unidades, ingresos)
+        .join(PedidoDetalle, PedidoDetalle.producto_id == Producto.id)
+        .join(Pedido, Pedido.id == PedidoDetalle.pedido_id)
+        .join(Categoria, Categoria.id == Producto.categoria_id)
+        .filter(Pedido.estado != PedidoEstado.cancelado, Pedido.creado_en >= inicio, Pedido.creado_en < fin)
+        .group_by(Producto.id, Producto.sku, Producto.nombre, Categoria.nombre)
+        .order_by(unidades.desc(), ingresos.desc())
+    )
+    if limite:
+        consulta = consulta.limit(limite)
+    return [
+        ProductoVentaOut(producto_id=pid, sku=sku, nombre=nombre, categoria=cat,
+                         unidades=int(u), ingresos=float(i))
+        for pid, sku, nombre, cat, u, i in consulta.all()
+    ]
+
+
+def ventas_por_categoria(db: Session, inicio: datetime, fin: datetime) -> List[CategoriaVentaOut]:
+    unidades = func.sum(PedidoDetalle.cantidad)
+    ingresos = func.sum(PedidoDetalle.cantidad * PedidoDetalle.precio_unitario)
+    filas = (
+        db.query(Categoria.nombre, unidades, ingresos)
+        .join(Producto, Producto.categoria_id == Categoria.id)
+        .join(PedidoDetalle, PedidoDetalle.producto_id == Producto.id)
+        .join(Pedido, Pedido.id == PedidoDetalle.pedido_id)
+        .filter(Pedido.estado != PedidoEstado.cancelado, Pedido.creado_en >= inicio, Pedido.creado_en < fin)
+        .group_by(Categoria.nombre)
+        .order_by(ingresos.desc())
+        .all()
+    )
+    total = sum(float(i) for _, _, i in filas)
+    return [
+        CategoriaVentaOut(
+            categoria=cat, unidades=int(u), ingresos=float(i),
+            porcentaje_ingresos=round(float(i) / total * 100, 1) if total else 0.0,
+        )
+        for cat, u, i in filas
+    ]
+
+
+def productos_con_stock_bajo(db: Session) -> List[StockBajoOut]:
+    """Productos activos con stock igual o menor al mínimo, con su reposición pendiente si existe."""
+    stock = stock_por_producto(db)
+    abiertas = {
+        c.producto_id: c
+        for c in db.query(CompraSugerida).filter(CompraSugerida.estado.in_(ESTADOS_COMPRA_ABIERTOS)).all()
+    }
+    salida = []
+    for p in db.query(Producto).filter(Producto.activo.is_(True)).order_by(Producto.nombre).all():
+        actual = stock.get(p.id, 0)
+        if actual <= p.stock_minimo:
+            compra = abiertas.get(p.id)
+            salida.append(StockBajoOut(
+                producto_id=p.id, sku=p.sku, nombre=p.nombre, categoria=p.categoria.nombre,
+                stock=actual, stock_minimo=p.stock_minimo,
+                compra=compra.codigo if compra else None,
+                compra_estado=compra.estado if compra else None,
+            ))
+    return sorted(salida, key=lambda x: x.stock - x.stock_minimo)
+
+
+def resumir_etapa(nombre: str, minutos: list, esperado: Optional[int]) -> dict:
+    """Promedio de una etapa y qué porcentaje de pedidos se pasó del tiempo esperado."""
+    if not minutos:
+        return {"etapa": nombre, "pedidos": 0, "promedio_minutos": None,
+                "esperado_minutos": esperado, "porcentaje_fuera_de_plazo": None}
+    fuera = None
+    if esperado is not None:
+        fuera = round(sum(1 for m in minutos if m > esperado) / len(minutos) * 100, 1)
+    return {"etapa": nombre, "pedidos": len(minutos), "promedio_minutos": round(sum(minutos) / len(minutos), 1),
+            "esperado_minutos": esperado, "porcentaje_fuera_de_plazo": fuera}
+
+
+def tiempos_por_etapa(db: Session, inicio: datetime, fin: datetime) -> List[EtapaOut]:
+    """Tiempo que toma cada etapa de los pedidos creados en el período, a partir de la cadena de custodia."""
+    eventos = (
+        db.query(PedidoEvento.pedido_id, PedidoEvento.estado, PedidoEvento.creado_en)
+        .join(Pedido, Pedido.id == PedidoEvento.pedido_id)
+        .filter(Pedido.creado_en >= inicio, Pedido.creado_en < fin)
+        .order_by(PedidoEvento.id)
+        .all()
+    )
+    por_pedido = {}
+    for pedido_id, estado, momento in eventos:
+        por_pedido.setdefault(pedido_id, {}).setdefault(estado, con_zona(momento))
+
+    tramos = [
+        ("cola", PedidoEstado.registrado, PedidoEstado.alistando, None),
+        ("alistamiento", PedidoEstado.alistando, PedidoEstado.en_zona_envios, obtener_etapa_esperada(db, "alistamiento")),
+        ("espera_en_zona", PedidoEstado.en_zona_envios, PedidoEstado.recibido_transportista, None),
+        ("ruta", PedidoEstado.en_ruta, PedidoEstado.entregado, obtener_etapa_esperada(db, "ruta")),
+    ]
+    salida = []
+    for nombre, desde_estado, hasta_estado, esperado in tramos:
+        minutos = []
+        for marcas in por_pedido.values():
+            if desde_estado in marcas and hasta_estado in marcas:
+                minutos.append(max(horas_entre(marcas[desde_estado], marcas[hasta_estado]) * 60, 0.0))
+        salida.append(EtapaOut(**resumir_etapa(nombre, minutos, esperado)))
+    return salida
+
+
+def datos_entregas(db: Session, inicio: datetime, fin: datetime) -> dict:
+    """Entregas del período contra la fecha prometida (retraso de entrega)."""
+    filas = (
+        db.query(Pedido, PedidoEvento.creado_en)
+        .join(PedidoEvento, PedidoEvento.pedido_id == Pedido.id)
+        .filter(PedidoEvento.estado == PedidoEstado.entregado,
+                PedidoEvento.creado_en >= inicio, PedidoEvento.creado_en < fin)
+        .all()
+    )
+    a_tiempo = 0
+    retrasos = []
+    for pedido, entregado_en in filas:
+        prometida = con_zona(pedido.fecha_prometida)
+        entregado = con_zona(entregado_en)
+        if prometida is None or entregado <= prometida:
+            a_tiempo += 1
+        else:
+            retrasos.append(horas_entre(prometida, entregado))
+    entregadas = a_tiempo + len(retrasos)
+    vencidos = int(
+        db.query(func.count(Pedido.id))
+        .filter(Pedido.estado.in_(ESTADOS_ACTIVOS), Pedido.fecha_prometida < datetime.now(timezone.utc))
+        .scalar() or 0
+    )
+    return {
+        "entregadas": entregadas,
+        "a_tiempo": a_tiempo,
+        "tardias": len(retrasos),
+        "porcentaje_a_tiempo": round(a_tiempo / entregadas * 100, 1) if entregadas else None,
+        "retraso_promedio_horas": round(sum(retrasos) / len(retrasos), 1) if retrasos else None,
+        "vencidos_en_curso": vencidos,
+    }
+
+
+def horas_extra_del_periodo(db: Session, desde: date, hasta: date) -> List[HorasExtraPersonaOut]:
+    ahora = ahora_local()
+    extras = extras_aprobadas(db, desde, hasta)
+    tope = obtener_tope_extra(db)
+    por_persona = {}
+    jornadas = db.query(Jornada).filter(Jornada.fecha >= desde, Jornada.fecha <= hasta).all()
+    for j in jornadas:
+        calculo = calcular_jornada_guardada(j, extras, tope, ahora)
+        fila = por_persona.setdefault(j.usuario_id, {
+            "usuario": j.usuario.nombre, "jornadas": 0, "extra": 0.0, "sin_salida": 0,
+        })
+        fila["jornadas"] += 1
+        fila["extra"] += calculo["horas_extra"]
+        if calculo["estado"] == "salida_no_registrada":
+            fila["sin_salida"] += 1
+    return sorted(
+        (HorasExtraPersonaOut(
+            usuario_id=uid, usuario=f["usuario"], jornadas=f["jornadas"],
+            horas_extra=round(f["extra"], 2), salidas_no_registradas=f["sin_salida"],
+        ) for uid, f in por_persona.items()),
+        key=lambda x: (-x.horas_extra, x.usuario),
+    )
+
+
+# ===========================================================================
+# MÓDULO: ESTADÍSTICAS (gerente y administrador)
+# ===========================================================================
+@app.get("/estadisticas/productos", response_model=VentasProductosOut, tags=["estadisticas"])
+def estadistica_productos(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    limite: int = 10,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Producto más vendido y ventas por producto (por defecto, últimos 30 días)."""
+    desde, hasta, inicio, fin = rango_periodo(desde, hasta)
+    productos = ventas_por_producto(db, inicio, fin, max(1, min(limite, 100)))
+    return VentasProductosOut(
+        desde=desde, hasta=hasta, mas_vendido=productos[0] if productos else None, productos=productos,
+    )
+
+
+@app.get("/estadisticas/categorias", response_model=VentasCategoriasOut, tags=["estadisticas"])
+def estadistica_categorias(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Ventas por categoría: procesadores, tarjetas gráficas, memoria RAM, SSD, tarjetas madre y fuentes."""
+    desde, hasta, inicio, fin = rango_periodo(desde, hasta)
+    categorias = ventas_por_categoria(db, inicio, fin)
+    return VentasCategoriasOut(
+        desde=desde, hasta=hasta, total_ingresos=round(sum(c.ingresos for c in categorias), 2), categorias=categorias,
+    )
+
+
+@app.get("/estadisticas/stock-bajo", response_model=List[StockBajoOut], tags=["estadisticas"])
+def estadistica_stock_bajo(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Stock bajo y reposiciones pendientes: los productos más urgentes primero."""
+    return productos_con_stock_bajo(db)
+
+
+@app.get("/estadisticas/entregas", response_model=EntregasOut, tags=["estadisticas"])
+def estadistica_entregas(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Entregas a tiempo frente a tardías (retraso de entrega) y tiempo por etapa contra lo esperado."""
+    desde, hasta, inicio, fin = rango_periodo(desde, hasta)
+    return EntregasOut(desde=desde, hasta=hasta, etapas=tiempos_por_etapa(db, inicio, fin),
+                       **datos_entregas(db, inicio, fin))
+
+
+@app.get("/estadisticas/horas-extra", response_model=HorasExtraResumenOut, tags=["estadisticas"])
+def estadistica_horas_extra(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Horas extra del período por persona, y cuántas jornadas quedaron «salida no registrada»."""
+    desde, hasta, _, _ = rango_periodo(desde, hasta)
+    personas = horas_extra_del_periodo(db, desde, hasta)
+    return HorasExtraResumenOut(
+        desde=desde, hasta=hasta, total_horas_extra=round(sum(p.horas_extra for p in personas), 2),
+        personas=personas,
+    )
+
+
+@app.get("/estadisticas/panel", response_model=PanelOut, tags=["estadisticas"])
+def panel_gerencia(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Tarjetas del panel de gerencia: ventas, entregas, stock, compras, jornadas, horas extra y energía."""
+    desde, hasta, inicio, fin = rango_periodo(desde, hasta)
+
+    pedidos = db.query(Pedido).filter(Pedido.creado_en >= inicio, Pedido.creado_en < fin).all()
+    por_estado = {}
+    for p in pedidos:
+        por_estado[p.estado.value] = por_estado.get(p.estado.value, 0) + 1
+    productos = ventas_por_producto(db, inicio, fin)
+    entregas = datos_entregas(db, inicio, fin)
+    horas_extra = horas_extra_del_periodo(db, desde, hasta)
+
+    ahora_utc = datetime.now(timezone.utc)
+    atrasadas = int(
+        db.query(func.count(CompraSugerida.id))
+        .filter(CompraSugerida.estado == CompraEstado.aprobada, CompraSugerida.fecha_estimada < ahora_utc)
+        .scalar() or 0
+    )
+    pendientes = int(
+        db.query(func.count(CompraSugerida.id))
+        .filter(CompraSugerida.estado.in_(ESTADOS_COMPRA_ABIERTOS)).scalar() or 0
+    )
+    consumo = calcular_consumo(db, desde, hasta)
+    kwh = sum((z["jornada"] + z["continuo"] for z in consumo["zonas"].values()), Decimal("0"))
+
+    return PanelOut(
+        desde=desde, hasta=hasta,
+        pedidos=len(pedidos), pedidos_por_estado=por_estado,
+        ventas_total=round(sum(p.ingresos for p in productos), 2),
+        unidades_vendidas=sum(p.unidades for p in productos),
+        producto_mas_vendido=productos[0] if productos else None,
+        entregas_a_tiempo=entregas["a_tiempo"], entregas_tardias=entregas["tardias"],
+        porcentaje_a_tiempo=entregas["porcentaje_a_tiempo"],
+        pedidos_vencidos_en_curso=entregas["vencidos_en_curso"],
+        productos_stock_bajo=len(productos_con_stock_bajo(db)),
+        compras_pendientes=pendientes, mercancia_atrasada=atrasadas,
+        jornadas_salida_no_registrada=sum(p.salidas_no_registradas for p in horas_extra),
+        horas_extra_total=round(sum(p.horas_extra for p in horas_extra), 2),
+        energia_kwh=_redondear(kwh), energia_costo=_redondear(kwh * obtener_tarifa_kwh(db)),
+    )
