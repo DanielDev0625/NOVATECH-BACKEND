@@ -4,6 +4,7 @@ App, seguridad (hash, JWT, roles) y rutas.
   B1: base del proyecto, login con roles y despliegue en Vercel.
   B2: catálogo, importación de Excel y lotes con código autogenerado.
 """
+from abc import ABC, abstractmethod
 import io
 import math
 import os
@@ -130,6 +131,8 @@ def crear_tablas_y_admin():
 # ===========================================================================
 # SEGURIDAD: hash, JWT y roles
 # ===========================================================================
+# POO · ENCAPSULAMIENTO: la contraseña nunca se guarda ni se devuelve en claro; solo vive su hash
+#   (password_hash), y estas funciones son la única puerta para crearlo y verificarlo.
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -185,6 +188,8 @@ def usuario_actual(
     return usuario
 
 
+# POO · ABSTRACCIÓN: cada ruta declara QUÉ roles necesita con una línea, sin repetir CÓMO se lee el token,
+#   se busca al usuario y se compara el rol. Ese detalle queda escondido aquí.
 def requiere_roles(*roles: Rol):
     """Dependencia que deja pasar solo a los roles indicados."""
     def verificador(usuario: Usuario = Depends(usuario_actual)) -> Usuario:
@@ -204,6 +209,8 @@ TODO_PERSONAL = (Rol.operario, Rol.transportista, Rol.gerente, Rol.administrador
 
 # ===========================================================================
 # ESQUEMAS (validaciones de entrada y salida)
+# POO · HERENCIA: todos los esquemas heredan de BaseModel (Pydantic), que ya sabe validar y convertir datos.
+#   Algunos heredan de otro esquema nuestro: RecibirIn y EntregarIn extienden PosicionIn.
 # ===========================================================================
 # --- Auth y usuarios (B1) ---
 class LoginIn(BaseModel):
@@ -1118,10 +1125,12 @@ class ListoIn(BaseModel):
     escaneados: List[ItemPedido] = Field(min_length=1, max_length=50)
 
 
+# POO · HERENCIA: RecibirIn extiende PosicionIn (latitud y longitud opcionales) y solo agrega el código del QR.
 class RecibirIn(PosicionIn):
     codigo: str = Field(min_length=1, max_length=30)     # QR del paquete (código del pedido)
 
 
+# POO · HERENCIA: EntregarIn también extiende PosicionIn y agrega el QR que muestra el cliente.
 class EntregarIn(PosicionIn):
     qr: str = Field(min_length=1, max_length=64)         # QR que muestra el cliente
 
@@ -2344,6 +2353,8 @@ def distancia_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radio * math.asin(math.sqrt(a))
 
 
+# POO · ABSTRACCIÓN: el resto del sistema pide «planear la ruta» y no sabe cómo se hace.
+#   Para usar Google Maps u otro servicio basta cambiar esta función; las rutas de la API no cambian.
 def planear_ruta(origen: tuple, paradas: list) -> list:
     """Ordena las paradas yendo siempre a la más cercana y calcula distancias y llegada estimada.
     origen: (latitud, longitud). paradas: lista de dicts con 'latitud' y 'longitud'.
@@ -2549,16 +2560,17 @@ def estado_transportistas(
 # ===========================================================================
 def crear_liquidacion(db: Session, pedido: Pedido, transportista: Usuario) -> Liquidacion:
     """Se llama al entregar: congela la tarifa y la comisión vigentes en ese momento."""
-    tarifa = obtener_tarifa_entrega(db)
-    if tarifa <= 0:
-        raise HTTPException(status.HTTP_409_CONFLICT, "La tarifa de entrega debe ser mayor que cero")
-    porcentaje = obtener_comision(db)
+    # POO · ENCAPSULAMIENTO: ReglaLiquidacion valida la tarifa y la comisión y calcula la ganancia por dentro.
+    try:
+        regla = ReglaLiquidacion(obtener_tarifa_entrega(db), obtener_comision(db))
+    except ValueError as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error))
     liquidacion = Liquidacion(
         pedido_id=pedido.id,
         transportista_id=transportista.id,
-        tarifa=tarifa,
-        comision_porcentaje=porcentaje,
-        comision=(tarifa * porcentaje / 100).quantize(Decimal("0.01")),
+        tarifa=regla.tarifa_entrega,
+        comision_porcentaje=regla.comision_porcentaje,
+        comision=regla.comision(),
     )
     db.add(liquidacion)
     return liquidacion
@@ -2918,6 +2930,7 @@ def registrar_bitacora(db: Session, usuario_id: Optional[int], accion: str, deta
 # ===========================================================================
 # CÁLCULO DE HORAS (reglas del documento)
 # ===========================================================================
+# POO · ABSTRACCIÓN: encapsula las reglas de horas normales y extra (sección 9.4 del documento) en una sola función.
 def calcular_horas_jornada(inicio_prog: datetime, salida_prog: datetime,
                            ultima_actividad: Optional[datetime], salida_real: Optional[datetime],
                            extra_fin: Optional[datetime], es_correccion: bool,
@@ -3507,6 +3520,7 @@ def listar_zonas(
     return [zona_a_out(z) for z in db.query(Zona).filter(Zona.activa.is_(True)).order_by(Zona.nombre).all()]
 
 
+# POO · ABSTRACCIÓN: oculta la diferencia entre equipos «continuo» y «por jornada» detrás de una sola operación (kW × horas).
 def kwh_equipo_dia(potencia_kw, tipo: str, hubo_jornada: bool, horas_normales: float, horas_extra: float) -> Decimal:
     """kWh de un equipo en un día: kW × horas.
     «continuo» funciona 24 h; «jornada» solo si ese día hubo jornada: horas normales + horas extra aprobadas."""
@@ -3591,10 +3605,11 @@ def consumo_energia(
     desde = desde or hasta.replace(day=1)
     if desde > hasta or (hasta - desde).days > 366:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Rango de fechas no válido (máximo 366 días)")
-    tarifa = obtener_tarifa_kwh(db)
-    factor = obtener_factor_co2(db)
-    if tarifa <= 0:
-        raise HTTPException(status.HTTP_409_CONFLICT, "La tarifa por kWh debe ser mayor que cero")
+    # POO · ENCAPSULAMIENTO: TarifaEnergia valida la tarifa y el factor, y calcula costo y huella de carbono.
+    try:
+        energia = TarifaEnergia(obtener_tarifa_kwh(db), obtener_factor_co2(db))
+    except ValueError as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error))
 
     datos = calcular_consumo(db, desde, hasta)
     zonas = []
@@ -3605,22 +3620,22 @@ def consumo_energia(
         zonas.append(ConsumoZonaOut(
             zona_id=zona_id, zona=z["nombre"],
             kwh_jornada=_redondear(z["jornada"]), kwh_continuo=_redondear(z["continuo"]),
-            kwh=_redondear(kwh), costo=_redondear(kwh * tarifa), co2_kg=_redondear(kwh * factor),
+            kwh=_redondear(kwh), costo=_redondear(energia.costo(kwh)), co2_kg=_redondear(energia.huella_co2(kwh)),
         ))
     diario = [
         ConsumoDiaOut(
             fecha=d["fecha"], hubo_jornada=d["hubo_jornada"], horas_normales=d["horas_normales"],
             horas_extra=d["horas_extra"], kwh=_redondear(d["kwh"]),
-            costo=_redondear(d["kwh"] * tarifa), co2_kg=_redondear(d["kwh"] * factor),
+            costo=_redondear(energia.costo(d["kwh"])), co2_kg=_redondear(energia.huella_co2(d["kwh"])),
         )
         for d in datos["diario"]
     ]
     despachados = pedidos_despachados(db, desde, hasta)
     return ConsumoOut(
-        desde=desde, hasta=hasta, tarifa_kwh=float(tarifa), factor_co2=float(factor),
+        desde=desde, hasta=hasta, tarifa_kwh=float(energia.tarifa_kwh), factor_co2=float(energia.factor_co2),
         zonas=zonas, diario=diario,
-        total_kwh=_redondear(total_kwh), total_costo=_redondear(total_kwh * tarifa),
-        total_co2_kg=_redondear(total_kwh * factor),
+        total_kwh=_redondear(total_kwh), total_costo=_redondear(energia.costo(total_kwh)),
+        total_co2_kg=_redondear(energia.huella_co2(total_kwh)),
         pedidos_despachados=despachados,
         kwh_por_pedido=_redondear(total_kwh / despachados) if despachados else None,
     )
@@ -4095,3 +4110,277 @@ def panel_gerencia(
         horas_extra_total=round(sum(p.horas_extra for p in horas_extra), 2),
         energia_kwh=_redondear(kwh), energia_costo=_redondear(kwh * obtener_tarifa_kwh(db)),
     )
+
+
+# ===========================================================================
+# PROGRAMACIÓN ORIENTADA A OBJETOS (POO) — sección 6.7 del documento de diseño
+# ===========================================================================
+# MAPA DE LA POO EN ESTE PROYECTO (se busca con «POO ·» en cualquiera de los dos archivos)
+#
+#   ABSTRACCIÓN     Modulo (clase abstracta, más abajo) y ModeloBase (models.py): definen QUÉ debe tener
+#                   cada pieza sin decir CÓMO. También requiere_roles, planear_ruta, calcular_horas_jornada
+#                   y kwh_equipo_dia: esconden el detalle detrás de un nombre claro.
+#   HERENCIA        Trazabilidad, Logistica y Energia heredan de Modulo. Todas las tablas heredan de
+#                   ModeloBase. Los esquemas heredan de BaseModel (RecibirIn y EntregarIn, de PosicionIn).
+#   ENCAPSULAMIENTO ReglaLiquidacion y TarifaEnergia (más abajo): atributos privados que solo cambian por
+#                   medio de propiedades que validan (tarifa mayor que cero, comisión entre 0 y 100).
+#                   También hash_password y Usuario.es_personal.
+#   POLIMORFISMO    Cada módulo sobrescribe resumen(); GestionCentralizada los recorre y los ejecuta sin
+#                   preguntar de qué tipo es cada uno (ruta GET /gestion/resumen).
+#
+# Todo el código está en main.py y models.py, como se acordó (sin archivos adicionales).
+
+
+# ---------------------------------------------------------------------------
+# ENCAPSULAMIENTO 1: la regla de liquidación del transportista
+# ---------------------------------------------------------------------------
+class ReglaLiquidacion:
+    """Tarifa fija por entrega y porcentaje que gana el transportista.
+    POO · ENCAPSULAMIENTO: los atributos son privados (doble guion bajo). Desde afuera solo se leen y se
+    cambian por las propiedades, que rechazan valores inválidos. Así nadie puede dejar una tarifa en cero
+    ni una comisión del 150 %."""
+
+    def __init__(self, tarifa_entrega, comision_porcentaje):
+        self.__tarifa_entrega = Decimal("0")          # privado: no se toca desde afuera
+        self.__comision_porcentaje = Decimal("0")     # privado
+        self.tarifa_entrega = tarifa_entrega          # pasa por el setter, que valida
+        self.comision_porcentaje = comision_porcentaje
+
+    @property
+    def tarifa_entrega(self) -> Decimal:
+        return self.__tarifa_entrega
+
+    @tarifa_entrega.setter
+    def tarifa_entrega(self, valor) -> None:
+        valor = Decimal(str(valor))
+        if valor <= 0:
+            raise ValueError("La tarifa de entrega debe ser mayor que cero")
+        self.__tarifa_entrega = valor
+
+    @property
+    def comision_porcentaje(self) -> Decimal:
+        return self.__comision_porcentaje
+
+    @comision_porcentaje.setter
+    def comision_porcentaje(self, valor) -> None:
+        valor = Decimal(str(valor))
+        if valor < 0 or valor > 100:
+            raise ValueError("La comisión debe estar entre 0 y 100 %")
+        self.__comision_porcentaje = valor
+
+    def comision(self) -> Decimal:
+        """Lo que gana el transportista por una entrega."""
+        return (self.__tarifa_entrega * self.__comision_porcentaje / 100).quantize(Decimal("0.01"))
+
+
+# ---------------------------------------------------------------------------
+# ENCAPSULAMIENTO 2: la tarifa de energía y el factor de emisión
+# ---------------------------------------------------------------------------
+class TarifaEnergia:
+    """Tarifa por kWh y factor de emisión de CO2.
+    POO · ENCAPSULAMIENTO: atributos privados con validación al cambiarlos (la tarifa debe ser mayor
+    que cero, el factor no puede ser negativo). Costo y huella de carbono se calculan dentro de la clase."""
+
+    def __init__(self, tarifa_kwh, factor_co2):
+        self.__tarifa_kwh = Decimal("0")
+        self.__factor_co2 = Decimal("0")
+        self.tarifa_kwh = tarifa_kwh
+        self.factor_co2 = factor_co2
+
+    @property
+    def tarifa_kwh(self) -> Decimal:
+        return self.__tarifa_kwh
+
+    @tarifa_kwh.setter
+    def tarifa_kwh(self, valor) -> None:
+        valor = Decimal(str(valor))
+        if valor <= 0:
+            raise ValueError("La tarifa por kWh debe ser mayor que cero")
+        self.__tarifa_kwh = valor
+
+    @property
+    def factor_co2(self) -> Decimal:
+        return self.__factor_co2
+
+    @factor_co2.setter
+    def factor_co2(self, valor) -> None:
+        valor = Decimal(str(valor))
+        if valor < 0:
+            raise ValueError("El factor de emisión no puede ser negativo")
+        self.__factor_co2 = valor
+
+    def costo(self, kwh) -> Decimal:
+        """Costo = kWh × tarifa."""
+        return Decimal(str(kwh)) * self.__tarifa_kwh
+
+    def huella_co2(self, kwh) -> Decimal:
+        """Huella de carbono (kg) = kWh × factor."""
+        return Decimal(str(kwh)) * self.__factor_co2
+
+
+# ---------------------------------------------------------------------------
+# ABSTRACCIÓN + HERENCIA: la clase padre «Modulo» y sus hijos
+# ---------------------------------------------------------------------------
+class Modulo(ABC):
+    """POO · ABSTRACCIÓN: clase abstracta (ABC). Define lo que TODO módulo del sistema debe saber hacer
+    —entregar un resumen— pero no dice cómo; eso lo decide cada hijo. No se puede crear un «Modulo»
+    suelto: Python lo impide porque resumen() es un método abstracto.
+    POO · ENCAPSULAMIENTO: los datos del módulo son atributos protegidos (un guion bajo) y el nombre
+    se expone solo como propiedad de lectura."""
+
+    def __init__(self, nombre: str, db: Session, desde: date, hasta: date):
+        self._nombre = nombre
+        self._db = db
+        self._desde = desde
+        self._hasta = hasta
+        self._inicio = combinar_fecha_hora(desde, "00:00")
+        self._fin = combinar_fecha_hora(hasta + timedelta(days=1), "00:00")
+
+    @property
+    def nombre(self) -> str:
+        return self._nombre
+
+    @abstractmethod
+    def resumen(self) -> dict:
+        """Cada módulo hijo DEBE sobrescribir este método con su propio resumen."""
+
+    def ejecutar(self) -> dict:
+        """Método común heredado por todos los hijos: arma la respuesta llamando a resumen().
+        Aquí se ve el polimorfismo: este código no sabe qué hijo es; llama a resumen() y se ejecuta
+        la versión del hijo que corresponda."""
+        return {"modulo": self._nombre, "resumen": self.resumen()}
+
+
+class Trazabilidad(Modulo):
+    """POO · HERENCIA: hereda de Modulo (constructor, nombre y ejecutar()).
+    POO · POLIMORFISMO: sobrescribe resumen() con lo propio de la trazabilidad."""
+
+    def __init__(self, db: Session, desde: date, hasta: date):
+        super().__init__("Trazabilidad inteligente", db, desde, hasta)    # reutiliza el constructor del padre
+
+    def resumen(self) -> dict:                                             # sobrescritura del método abstracto
+        db = self._db
+        lotes = {
+            getattr(estado, "value", estado): int(total)
+            for estado, total in db.query(Lote.estado, func.count(Lote.id)).group_by(Lote.estado).all()
+        }
+        pedidos = {
+            getattr(estado, "value", estado): int(total)
+            for estado, total in (
+                db.query(Pedido.estado, func.count(Pedido.id))
+                .filter(Pedido.creado_en >= self._inicio, Pedido.creado_en < self._fin)
+                .group_by(Pedido.estado).all()
+            )
+        }
+        custodia = int(
+            db.query(func.count(PedidoEvento.id))
+            .filter(PedidoEvento.creado_en >= self._inicio, PedidoEvento.creado_en < self._fin)
+            .scalar() or 0
+        )
+        atrasadas = int(
+            db.query(func.count(CompraSugerida.id))
+            .filter(CompraSugerida.estado == CompraEstado.aprobada,
+                    CompraSugerida.fecha_estimada < datetime.now(timezone.utc))
+            .scalar() or 0
+        )
+        return {
+            "lotes_por_estado": lotes,
+            "pedidos_por_estado": pedidos,
+            "registros_de_custodia": custodia,
+            "mercancia_atrasada": atrasadas,
+        }
+
+
+class Logistica(Modulo):
+    """POO · HERENCIA: hereda de Modulo.
+    POO · POLIMORFISMO: sobrescribe resumen() con lo propio de la logística."""
+
+    def __init__(self, db: Session, desde: date, hasta: date):
+        super().__init__("Logística inteligente", db, desde, hasta)
+
+    def resumen(self) -> dict:                                             # sobrescritura del método abstracto
+        db = self._db
+        transportistas = int(
+            db.query(func.count(Usuario.id))
+            .filter(Usuario.rol == Rol.transportista, Usuario.activo.is_(True)).scalar() or 0
+        )
+        vehiculos = int(
+            db.query(func.count(Vehiculo.id))
+            .filter(Vehiculo.activo.is_(True), Vehiculo.transportista_id.isnot(None)).scalar() or 0
+        )
+        en_reparto = int(
+            db.query(func.count(Pedido.id)).filter(Pedido.estado.in_(ESTADOS_EN_REPARTO)).scalar() or 0
+        )
+        entregas = datos_entregas(db, self._inicio, self._fin)
+        pendiente = db.query(func.coalesce(func.sum(Liquidacion.comision), 0)).filter(
+            Liquidacion.pagada.is_(False)
+        ).scalar()
+        return {
+            "transportistas_activos": transportistas,
+            "vehiculos_asignados": vehiculos,
+            "pedidos_en_reparto": en_reparto,
+            "entregas_a_tiempo": entregas["a_tiempo"],
+            "entregas_tardias": entregas["tardias"],
+            "comision_pendiente": float(pendiente or 0),
+        }
+
+
+class Energia(Modulo):
+    """POO · HERENCIA: hereda de Modulo.
+    POO · POLIMORFISMO: sobrescribe resumen() con lo propio de la eficiencia energética.
+    POO · ENCAPSULAMIENTO: usa TarifaEnergia para calcular costo y huella sin tocar sus atributos privados."""
+
+    def __init__(self, db: Session, desde: date, hasta: date):
+        super().__init__("Eficiencia energética", db, desde, hasta)
+
+    def resumen(self) -> dict:                                             # sobrescritura del método abstracto
+        db = self._db
+        tarifa = TarifaEnergia(obtener_tarifa_kwh(db), obtener_factor_co2(db))
+        datos = calcular_consumo(db, self._desde, self._hasta)
+        kwh = sum((z["jornada"] + z["continuo"] for z in datos["zonas"].values()), Decimal("0"))
+        despachados = pedidos_despachados(db, self._desde, self._hasta)
+        return {
+            "kwh": _redondear(kwh),
+            "costo": _redondear(tarifa.costo(kwh)),
+            "co2_kg": _redondear(tarifa.huella_co2(kwh)),
+            "pedidos_despachados": despachados,
+            "kwh_por_pedido": _redondear(kwh / despachados) if despachados else None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# POLIMORFISMO: la gestión centralizada
+# ---------------------------------------------------------------------------
+class GestionCentralizada:
+    """POO · POLIMORFISMO: recibe una lista de módulos y los recorre SIN distinguir su tipo.
+    Para agregar un módulo nuevo (por ejemplo «Compras») basta crear otro hijo de Modulo y ponerlo
+    en la lista: esta clase no cambia. Es la «sincronización y toma de decisiones» del documento."""
+
+    def __init__(self, modulos: List[Modulo]):
+        self._modulos = list(modulos)
+
+    def resumen_general(self) -> List[dict]:
+        # No hay ningún «if es Trazabilidad / if es Logistica»: cada objeto sabe armar su propio resumen.
+        return [modulo.ejecutar() for modulo in self._modulos]
+
+
+@app.get("/gestion/resumen", tags=["gestion"])
+def resumen_gestion_centralizada(
+    desde: Optional[date] = None,
+    hasta: Optional[date] = None,
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*ADMIN_Y_GERENTE)),
+):
+    """Gestión centralizada: el resumen de los módulos de trazabilidad, logística y energía en una sola
+    respuesta (por defecto, los últimos 30 días). Demuestra el polimorfismo de la sección 6.7."""
+    desde, hasta, _inicio, _fin = rango_periodo(desde, hasta)
+    gestion = GestionCentralizada([
+        Trazabilidad(db, desde, hasta),
+        Logistica(db, desde, hasta),
+        Energia(db, desde, hasta),
+    ])
+    try:
+        modulos = gestion.resumen_general()
+    except ValueError as error:      # por ejemplo, una tarifa de energía en cero
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error))
+    return {"desde": desde, "hasta": hasta, "modulos": modulos}
