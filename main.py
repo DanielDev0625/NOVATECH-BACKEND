@@ -1320,6 +1320,31 @@ def marcar_principal(
     return direccion_a_out(direccion)
 
 
+@app.delete("/direcciones/{direccion_id}", status_code=204, tags=["direcciones"])
+def borrar_direccion(
+    direccion_id: int,
+    db: Session = Depends(get_db),
+    cliente: Usuario = Depends(requiere_roles(*SOLO_CLIENTE)),
+):
+    """Borra una dirección que no se haya usado en pedidos. Si era la principal, pasa a serlo la más antigua."""
+    direccion = db.get(Direccion, direccion_id)
+    if direccion is None or direccion.usuario_id != cliente.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Dirección no encontrada")
+    if db.query(Pedido).filter(Pedido.direccion_id == direccion.id).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, "Esta dirección ya se usó en un pedido; no se puede borrar")
+    era_principal = direccion.principal
+    db.delete(direccion)
+    db.flush()
+    if era_principal:
+        siguiente = (
+            db.query(Direccion).filter(Direccion.usuario_id == cliente.id).order_by(Direccion.id).first()
+        )
+        if siguiente is not None:
+            siguiente.principal = True
+    db.commit()
+    return Response(status_code=204)
+
+
 # ===========================================================================
 # MÓDULO: PEDIDOS — construcción de respuestas y reglas comunes
 # ===========================================================================
