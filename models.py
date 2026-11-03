@@ -212,7 +212,9 @@ class Pedido(ModeloBase):
         index=True,
         nullable=False,
     )
-    total = Column(Numeric(14, 2), nullable=False, default=0)
+    total = Column(Numeric(14, 2), nullable=False, default=0)          # solo productos
+    # C3: envío que paga el cliente (la tarifa por entrega vigente al pedir). Se paga contra entrega.
+    costo_envio = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
     fecha_prometida = Column(DateTime(timezone=True))
     qr_entrega = Column(String(64), nullable=False)       # lo muestra el cliente al transportista
     operario_id = Column(Integer, ForeignKey("usuarios.id"))

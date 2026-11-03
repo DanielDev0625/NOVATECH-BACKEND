@@ -27,7 +27,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func, text
+from sqlalchemy import func, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -106,10 +106,19 @@ def get_db():
         db.close()
 
 
+def agregar_columnas_nuevas():
+    """Agrega a tablas ya existentes las columnas que llegaron después (sin borrar datos)."""
+    columnas = {c["name"] for c in inspect(engine).get_columns("pedidos")}
+    if "costo_envio" not in columnas:
+        with engine.begin() as conexion:
+            conexion.execute(text("ALTER TABLE pedidos ADD COLUMN costo_envio NUMERIC(14, 2) NOT NULL DEFAULT 0"))
+
+
 def crear_tablas_y_admin():
     """Crea las tablas, las categorías base y, si no existe ningún administrador,
     crea el primero con ADMIN_USUARIO / ADMIN_PASSWORD (variables de entorno)."""
     Base.metadata.create_all(bind=engine)
+    agregar_columnas_nuevas()
     db = SessionLocal()
     try:
         for nombre in CATEGORIAS:
@@ -1164,7 +1173,10 @@ class PedidoOut(BaseModel):
     codigo: str
     estado: PedidoEstado
     cliente: Optional[str]
-    total: float
+    total: float                    # productos
+    costo_envio: float = 0
+    total_a_pagar: float = 0        # productos + envío (lo que se cobra al entregar)
+    metodo_pago: str = "contra_entrega"
     fecha_prometida: Optional[datetime]
     creado_en: Optional[datetime]
     direccion: DireccionOut
@@ -1179,6 +1191,8 @@ class PedidoResumenOut(BaseModel):
     estado: PedidoEstado
     cliente: Optional[str]
     total: float
+    costo_envio: float = 0
+    total_a_pagar: float = 0
     unidades: int
     fecha_prometida: Optional[datetime]
     creado_en: Optional[datetime]
@@ -1381,7 +1395,9 @@ def pedido_a_out(pedido: Pedido, quien: Usuario) -> PedidoOut:
     return PedidoOut(
         id=pedido.id, codigo=pedido.codigo, estado=pedido.estado,
         cliente=None if es_cliente else pedido.cliente.nombre,
-        total=float(pedido.total), fecha_prometida=pedido.fecha_prometida,
+        total=float(pedido.total), costo_envio=float(pedido.costo_envio or 0),
+        total_a_pagar=float(pedido.total + (pedido.costo_envio or 0)),
+        fecha_prometida=pedido.fecha_prometida,
         creado_en=pedido.creado_en, direccion=direccion_a_out(pedido.direccion),
         lineas=lineas, eventos=eventos, qr_entrega=pedido.qr_entrega if ver_qr else None,
     )
@@ -1391,7 +1407,9 @@ def pedido_a_resumen(pedido: Pedido, quien: Usuario) -> PedidoResumenOut:
     return PedidoResumenOut(
         id=pedido.id, codigo=pedido.codigo, estado=pedido.estado,
         cliente=None if quien.rol == Rol.usuario else pedido.cliente.nombre,
-        total=float(pedido.total), unidades=sum(d.cantidad for d in pedido.detalles),
+        total=float(pedido.total), costo_envio=float(pedido.costo_envio or 0),
+        total_a_pagar=float(pedido.total + (pedido.costo_envio or 0)),
+        unidades=sum(d.cantidad for d in pedido.detalles),
         fecha_prometida=pedido.fecha_prometida, creado_en=pedido.creado_en,
     )
 
@@ -1513,6 +1531,7 @@ def crear_pedido(
         direccion_id=direccion.id,
         estado=PedidoEstado.registrado,
         total=Decimal("0"),
+        costo_envio=obtener_tarifa_entrega(db),
         fecha_prometida=datetime.now(timezone.utc) + timedelta(days=obtener_plazo_entrega(db)),
         qr_entrega=secrets.token_urlsafe(16),
     )
@@ -1546,6 +1565,24 @@ def crear_pedido(
         traceback.print_exc()
     db.refresh(pedido)
     return pedido_a_out(pedido, cliente)
+
+
+class CondicionesPedidoOut(BaseModel):
+    costo_envio: float
+    plazo_entrega_dias: int
+    metodo_pago: str = "contra_entrega"
+
+
+@app.get("/pedidos/condiciones", response_model=CondicionesPedidoOut, tags=["pedidos"])
+def condiciones_pedido(
+    db: Session = Depends(get_db),
+    _: Usuario = Depends(requiere_roles(*SOLO_CLIENTE)),
+):
+    """Lo que el cliente ve en el carrito antes de confirmar: envío, plazo y forma de pago (contra entrega)."""
+    return CondicionesPedidoOut(
+        costo_envio=float(obtener_tarifa_entrega(db)),
+        plazo_entrega_dias=obtener_plazo_entrega(db),
+    )
 
 
 @app.get("/pedidos/mios", response_model=List[PedidoResumenOut], tags=["pedidos"])
