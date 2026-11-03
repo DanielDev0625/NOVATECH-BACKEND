@@ -74,6 +74,9 @@ JWT_ALGORITMO = "HS256"
 TOKEN_HORAS = int(os.getenv("TOKEN_HORAS", "12"))
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 
+# App del cliente: su sesión dura más que la del personal (no tiene jornada).
+CLIENTE_TOKEN_DIAS = int(os.getenv("CLIENTE_TOKEN_DIAS", "30"))
+
 ADMIN_USUARIO = os.getenv("ADMIN_USUARIO", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 ADMIN_NOMBRE = os.getenv("ADMIN_NOMBRE", "Administrador")
@@ -147,7 +150,10 @@ def verificar_password(password: str, password_hash: str) -> bool:
 def crear_token(usuario: Usuario, expira: Optional[datetime] = None) -> str:
     """Token de sesión. Para el personal con jornada, `expira` es la hora de salida (o el fin de las horas extra aprobadas)."""
     ahora = datetime.now(timezone.utc)
-    vence = ahora + timedelta(hours=TOKEN_HORAS)
+    if usuario.rol == Rol.usuario:
+        vence = ahora + timedelta(days=CLIENTE_TOKEN_DIAS)
+    else:
+        vence = ahora + timedelta(hours=TOKEN_HORAS)
     if expira is not None:
         vence = min(vence, expira)
     payload = {
@@ -1188,7 +1194,7 @@ ESTADOS_ACTIVOS = (
 
 
 # ===========================================================================
-# CLIENTE (provisional hasta la fase C1: Google o celular)
+# CLIENTE: registro e ingreso con usuario y contraseña (app del cliente, C1)
 # ===========================================================================
 @app.post("/auth/registro-cliente", response_model=TokenOut, status_code=201, tags=["auth"])
 def registro_cliente(datos: ClienteRegistro, db: Session = Depends(get_db)):
