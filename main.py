@@ -2196,6 +2196,7 @@ class ParadaOut(BaseModel):
     distancia_km: float            # desde la parada anterior (o el origen)
     km_acumulados: float
     eta_minutos: int               # minutos estimados desde ahora
+    total_a_pagar: float = 0       # lo que el transportista cobra al entregar (contra entrega)
 
 
 class RutaOut(BaseModel):
@@ -2523,6 +2524,7 @@ def mi_ruta(
             orden=p["orden"], pedido_id=pedido.id, codigo=pedido.codigo, cliente=pedido.cliente.nombre,
             estado=pedido.estado, direccion=direccion_a_out(pedido.direccion),
             distancia_km=p["distancia_km"], km_acumulados=p["km_acumulados"], eta_minutos=p["eta_minutos"],
+            total_a_pagar=float(pedido.total + (pedido.costo_envio or 0)),
         ))
     return RutaOut(
         origen_latitud=origen[0], origen_longitud=origen[1], origen_es_posicion_real=es_real,
@@ -2591,6 +2593,58 @@ def seguimiento_pedido(
         destino_latitud=pedido.direccion.latitud, destino_longitud=pedido.direccion.longitud,
         transportista_posicion=posicion, parada=parada, eta_minutos=eta,
     )
+
+
+# ===========================================================================
+# C4 · NOTIFICACIONES DEL CLIENTE (cada cambio de estado de sus pedidos)
+# ===========================================================================
+TEXTOS_NOTIFICACION = {
+    PedidoEstado.registrado: ("Recibimos tu pedido", "Te avisamos cuando lo empecemos a alistar"),
+    PedidoEstado.alistando: ("Estamos alistando tu pedido", "Ya estamos reuniendo tus productos"),
+    PedidoEstado.en_zona_envios: ("Tu pedido está listo", "Está en la zona de envíos esperando transportista"),
+    PedidoEstado.recibido_transportista: ("Tu pedido ya tiene transportista", "Saldrá pronto a tu dirección"),
+    PedidoEstado.en_ruta: ("Tu pedido va en camino", "Ten listo el pago contra entrega y tu QR"),
+    PedidoEstado.entregado: ("Pedido entregado", "Gracias por tu compra"),
+    PedidoEstado.cancelado: ("Pedido cancelado", "Los productos volvieron a la tienda"),
+}
+DIAS_NOTIFICACIONES = 30
+
+
+class NotificacionOut(BaseModel):
+    id: int                   # id del evento; crece con el tiempo (sirve para saber cuáles son nuevas)
+    pedido_id: int
+    codigo: str
+    estado: PedidoEstado
+    titulo: str
+    texto: str
+    fecha: Optional[datetime]
+
+
+@app.get("/notificaciones", response_model=List[NotificacionOut], tags=["notificaciones"])
+def mis_notificaciones(
+    db: Session = Depends(get_db),
+    cliente: Usuario = Depends(requiere_roles(*SOLO_CLIENTE)),
+):
+    """Avisos del cliente de los últimos 30 días: uno por cada cambio de estado de sus pedidos, el más nuevo primero."""
+    desde = datetime.now(timezone.utc) - timedelta(days=DIAS_NOTIFICACIONES)
+    eventos = (
+        db.query(PedidoEvento)
+        .join(Pedido, PedidoEvento.pedido_id == Pedido.id)
+        .filter(Pedido.cliente_id == cliente.id, PedidoEvento.creado_en >= desde)
+        .order_by(PedidoEvento.id.desc())
+        .limit(100)
+        .all()
+    )
+    salida = []
+    for e in eventos:
+        titulo, texto = TEXTOS_NOTIFICACION.get(e.estado, ("Tu pedido cambió", e.estado.value))
+        if e.estado == PedidoEstado.en_ruta:
+            texto = f"Ten listo el pago contra entrega: $ {float(e.pedido.total + (e.pedido.costo_envio or 0)):,.0f}".replace(",", ".")
+        salida.append(NotificacionOut(
+            id=e.id, pedido_id=e.pedido_id, codigo=e.pedido.codigo, estado=e.estado,
+            titulo=titulo, texto=texto, fecha=e.creado_en,
+        ))
+    return salida
 
 
 @app.get("/logistica/transportistas", response_model=List[TransportistaEstadoOut], tags=["logistica"])
