@@ -136,6 +136,8 @@ def crear_tablas_y_admin():
                     rol=Rol.administrador,
                 ))
                 db.commit()
+
+        asegurar_vehiculos_de_transportistas(db)
     finally:
         db.close()
 
@@ -245,6 +247,7 @@ class UsuarioOut(BaseModel):
     usuario: str
     rol: Rol
     activo: bool
+    placa: Optional[str] = None      # solo transportistas: el vehículo asociado a la cuenta
 
 
 class TokenOut(BaseModel):
@@ -258,11 +261,23 @@ class UsuarioCrear(BaseModel):
     usuario: str = Field(min_length=3, max_length=50, pattern=r"^[a-zA-Z0-9._-]+$")
     password: str = Field(min_length=8, max_length=72)
     rol: Rol
+    # Solo para transportistas: el vehículo que queda asociado a la cuenta.
+    # Sin placa se le asigna una provisional (NT-0007) que el administrador puede cambiar después.
+    placa: Optional[str] = Field(default=None, min_length=5, max_length=10, pattern=r"^[A-Za-z0-9-]+$")
+    tipo_vehiculo: Literal["moto", "carro", "camioneta", "camion"] = "moto"
 
     @field_validator("usuario")
     @classmethod
     def usuario_en_minuscula(cls, v: str) -> str:
         return v.lower()
+
+    @field_validator("placa", mode="before")
+    @classmethod
+    def placa_limpia(cls, v):
+        if isinstance(v, str):
+            v = v.strip().upper()
+            return v or None
+        return v
 
     @field_validator("rol")
     @classmethod
@@ -447,6 +462,9 @@ def crear_usuario(
 ):
     if db.query(Usuario).filter(Usuario.usuario == datos.usuario).first():
         raise HTTPException(status.HTTP_409_CONFLICT, "Ese usuario ya existe")
+    es_transportista = datos.rol == Rol.transportista
+    if es_transportista and datos.placa and db.query(Vehiculo.id).filter(Vehiculo.placa == datos.placa).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe un vehículo con esa placa")
     nuevo = Usuario(
         nombre=datos.nombre.strip(),
         usuario=datos.usuario,
@@ -454,9 +472,18 @@ def crear_usuario(
         rol=datos.rol,
     )
     db.add(nuevo)
+    db.flush()
+    placa = None
+    if es_transportista:
+        # Cada transportista nace con su vehículo: así puede recibir paquetes desde el primer día.
+        placa = asegurar_vehiculo(db, nuevo, datos.placa, datos.tipo_vehiculo).placa
     db.commit()
     db.refresh(nuevo)
-    return nuevo
+    return usuario_a_out(nuevo, placa)
+
+
+def usuario_a_out(usuario: Usuario, placa: Optional[str] = None) -> UsuarioOut:
+    return UsuarioOut.model_validate(usuario).model_copy(update={"placa": placa})
 
 
 @app.get("/usuarios", response_model=List[UsuarioOut], tags=["usuarios"])
@@ -464,7 +491,11 @@ def listar_usuarios(
     db: Session = Depends(get_db),
     _: Usuario = Depends(requiere_roles(*SOLO_ADMIN)),
 ):
-    return db.query(Usuario).order_by(Usuario.id).all()
+    placas = {
+        v.transportista_id: v.placa
+        for v in db.query(Vehiculo).filter(Vehiculo.transportista_id.isnot(None)).all()
+    }
+    return [usuario_a_out(u, placas.get(u.id)) for u in db.query(Usuario).order_by(Usuario.id).all()]
 
 
 @app.patch("/usuarios/{usuario_id}/estado", response_model=UsuarioOut, tags=["usuarios"])
@@ -1727,11 +1758,12 @@ def recibir_transportista(
     exigir_estado(pedido, PedidoEstado.en_zona_envios)
     if datos.codigo.strip().upper() != pedido.codigo:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "El QR no corresponde a este pedido")
-    vehiculo = vehiculo_del_transportista(db, transportista)
-    if vehiculo is None:
+    # Si la cuenta quedó sin vehículo (p. ej. creada antes de este cambio), se le asocia uno ya.
+    vehiculo = asegurar_vehiculo(db, transportista)
+    if not vehiculo.activo:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "No tienes un vehículo asignado; pídele al administrador que te asigne uno",
+            f"Tu vehículo {vehiculo.placa} está fuera de servicio; pídele al administrador que lo active",
         )
     pedido.estado = PedidoEstado.recibido_transportista
     pedido.transportista_id = transportista.id
@@ -2351,6 +2383,48 @@ def vehiculo_del_transportista(db: Session, transportista: Usuario) -> Optional[
         .filter(Vehiculo.transportista_id == transportista.id, Vehiculo.activo.is_(True))
         .first()
     )
+
+
+def placa_provisional(db: Session, transportista: Usuario) -> str:
+    """«NT-0007» para el transportista 7 (con sufijo si esa placa ya existe)."""
+    base = f"NT-{transportista.id:04d}"
+    placa, n = base, 1
+    while db.query(Vehiculo.id).filter(Vehiculo.placa == placa).first():
+        placa, n = f"{base}-{n}", n + 1
+    return placa
+
+
+def asegurar_vehiculo(
+    db: Session, transportista: Usuario, placa: Optional[str] = None, tipo: str = "moto"
+) -> Vehiculo:
+    """Cada transportista tiene su vehículo asociado a la cuenta. Si aún no tiene ninguno
+    (activo o no), se le crea uno: con la placa dada o con una provisional. No hace commit."""
+    actual = db.query(Vehiculo).filter(Vehiculo.transportista_id == transportista.id).first()
+    if actual is not None:
+        return actual
+    vehiculo = Vehiculo(
+        placa=placa or placa_provisional(db, transportista),
+        tipo=tipo,
+        descripcion=None if placa else "Asignado automáticamente con la cuenta",
+        transportista_id=transportista.id,
+    )
+    db.add(vehiculo)
+    db.flush()
+    return vehiculo
+
+
+def asegurar_vehiculos_de_transportistas(db: Session) -> None:
+    """Al arrancar: las cuentas de transportista que no tengan vehículo reciben uno."""
+    sin_vehiculo = (
+        db.query(Usuario)
+        .filter(Usuario.rol == Rol.transportista)
+        .filter(~db.query(Vehiculo.id).filter(Vehiculo.transportista_id == Usuario.id).exists())
+        .all()
+    )
+    for transportista in sin_vehiculo:
+        asegurar_vehiculo(db, transportista)
+    if sin_vehiculo:
+        db.commit()
 
 
 @app.post("/vehiculos", response_model=VehiculoOut, status_code=201, tags=["vehiculos"])
